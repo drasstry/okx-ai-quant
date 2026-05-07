@@ -168,6 +168,13 @@ def test_telegram_report_command_triggers_forced_daily_report():
 
 
 def test_telegram_status_command_replies_with_runtime_summary():
+    class FakeStorage:
+        def get_state(self, _key):
+            return None
+
+    class FakeRunner:
+        storage = FakeStorage()
+
     class FakeSettings:
         TRADING_MODE = "demo"
         ENABLE_TRADING = False
@@ -176,6 +183,7 @@ def test_telegram_status_command_replies_with_runtime_summary():
 
     class FakeBot:
         settings = FakeSettings()
+        runner = FakeRunner()
 
         def send_daily_report(self, *, force=False):
             raise AssertionError("status should not send a report")
@@ -192,6 +200,53 @@ def test_telegram_status_command_replies_with_runtime_summary():
     cli._handle_telegram_text(FakeBot(), client, "/status")
 
     assert "mode=demo" in client.messages[0]
+    assert "source=telegram listener config" in client.messages[0]
+
+
+def test_telegram_status_prefers_active_bot_runtime_state():
+    class FakeStorage:
+        values = {
+            "runtime:mode": "demo",
+            "runtime:trading_enabled": "True",
+            "runtime:strategy": "ema-momentum",
+            "runtime:symbols": "BTC-USDT-SWAP",
+            "runtime:updated_at": "2026-05-07T08:00:00+00:00",
+        }
+
+        def get_state(self, key):
+            return self.values.get(key)
+
+    class FakeRunner:
+        storage = FakeStorage()
+
+    class FakeSettings:
+        TRADING_MODE = "demo"
+        ENABLE_TRADING = False
+        STRATEGY_NAME = "ema-rsi-atr"
+        symbols = ["ETH-USDT-SWAP"]
+
+    class FakeBot:
+        settings = FakeSettings()
+        runner = FakeRunner()
+
+        def send_daily_report(self, *, force=False):
+            raise AssertionError("status should not send a report")
+
+    class FakeClient:
+        def __init__(self):
+            self.messages = []
+
+        def send(self, message):
+            self.messages.append(message)
+
+    client = FakeClient()
+
+    cli._handle_telegram_text(FakeBot(), client, "/status")
+
+    assert "source=active bot runtime" in client.messages[0]
+    assert "trading=True" in client.messages[0]
+    assert "strategy=ema-momentum" in client.messages[0]
+    assert "listener_trading=False" in client.messages[0]
 
 
 def test_cli_menu_quits_after_showing_config(monkeypatch, capsys):

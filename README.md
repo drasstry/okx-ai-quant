@@ -381,6 +381,10 @@ Supported Telegram messages:
 - `日报`, `报告`, `总结`, `分析`
 - `/status`
 
+`/status` prefers the active bot runtime state written by the long-running
+bot. If no active runtime state exists yet, it falls back to the Telegram
+listener's own `.env` configuration.
+
 ---
 
 ## Supported Symbols

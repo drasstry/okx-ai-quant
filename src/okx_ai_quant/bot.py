@@ -40,6 +40,7 @@ class TradingBot:
         self._tradable_symbols_cache: list[str] | None = None
 
     def run_forever(self) -> None:
+        self.publish_runtime_status()
         self._notify(
             "OKX AI Quant bot started "
             f"(mode={self.settings.TRADING_MODE}, "
@@ -49,10 +50,24 @@ class TradingBot:
         )
         while True:
             started = time.time()
+            self.publish_runtime_status()
             self.run_once()
             self.maybe_send_daily_report()
             elapsed = time.time() - started
             time.sleep(max(5, self.settings.POLL_INTERVAL_SECONDS - elapsed))
+
+    def publish_runtime_status(self) -> None:
+        now = datetime.now(UTC)
+        runtime_values = {
+            "runtime:mode": str(self.settings.TRADING_MODE),
+            "runtime:trading_enabled": str(self.settings.ENABLE_TRADING),
+            "runtime:strategy": self.settings.STRATEGY_NAME,
+            "runtime:symbols": ", ".join(self.settings.symbols),
+            "runtime:poll_interval_seconds": str(self.settings.POLL_INTERVAL_SECONDS),
+            "runtime:updated_at": now.isoformat(),
+        }
+        for key, value in runtime_values.items():
+            self.runner.storage.set_state(key, value, now)
 
     def run_once(self) -> list[BotCycleResult]:
         self._sync_server_time()

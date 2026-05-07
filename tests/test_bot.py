@@ -160,6 +160,17 @@ def test_bot_submit_mode_places_order_after_dry_run(tmp_path):
     assert bot.runner.storage.load_open_orders()[0].order_id == "okx-order-1"
 
 
+def test_bot_publishes_runtime_status_for_telegram_status(tmp_path):
+    bot, _client = _bot(tmp_path, enable_trading=True)
+
+    bot.publish_runtime_status()
+
+    assert bot.runner.storage.get_state("runtime:mode") == "demo"
+    assert bot.runner.storage.get_state("runtime:trading_enabled") == "True"
+    assert bot.runner.storage.get_state("runtime:strategy") == "ema-rsi-atr"
+    assert bot.runner.storage.get_state("runtime:symbols") == "BTC-USDT-SWAP"
+
+
 def test_bot_records_open_position_plan_after_entry_fill(tmp_path):
     bot, client = _bot(tmp_path, enable_trading=True)
     bot.run_once()

@@ -134,15 +134,38 @@ def _handle_telegram_text(bot: TradingBot, client: TelegramBotClient, text: str)
         bot.send_daily_report(force=True)
         return
     if command == "/status":
-        client.send(
-            "OKX AI Quant status\n"
-            f"mode={bot.settings.TRADING_MODE}\n"
-            f"trading={bot.settings.ENABLE_TRADING}\n"
-            f"strategy={bot.settings.STRATEGY_NAME}\n"
-            f"symbols={', '.join(bot.settings.symbols)}"
-        )
+        client.send(_telegram_status_message(bot))
         return
     client.send("Supported commands: /report, 日报, 总结, /status")
+
+
+def _telegram_status_message(bot: TradingBot) -> str:
+    runtime_mode = bot.runner.storage.get_state("runtime:mode")
+    runtime_trading = bot.runner.storage.get_state("runtime:trading_enabled")
+    runtime_strategy = bot.runner.storage.get_state("runtime:strategy")
+    runtime_symbols = bot.runner.storage.get_state("runtime:symbols")
+    runtime_updated_at = bot.runner.storage.get_state("runtime:updated_at")
+
+    if runtime_mode is not None:
+        return (
+            "OKX AI Quant status\n"
+            "source=active bot runtime\n"
+            f"mode={runtime_mode}\n"
+            f"trading={runtime_trading}\n"
+            f"strategy={runtime_strategy}\n"
+            f"symbols={runtime_symbols}\n"
+            f"updated_at={runtime_updated_at}\n"
+            f"listener_trading={bot.settings.ENABLE_TRADING}"
+        )
+
+    return (
+        "OKX AI Quant status\n"
+        "source=telegram listener config\n"
+        f"mode={bot.settings.TRADING_MODE}\n"
+        f"trading={bot.settings.ENABLE_TRADING}\n"
+        f"strategy={bot.settings.STRATEGY_NAME}\n"
+        f"symbols={', '.join(bot.settings.symbols)}"
+    )
 
 
 def _prompt_choice(prompt: str, choices: Sequence[str], *, default: str | None = None) -> str:

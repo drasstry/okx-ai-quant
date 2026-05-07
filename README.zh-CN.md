@@ -390,6 +390,9 @@ uv run okx-ai-quant telegram-listen --mode demo
 - `日报`、`报告`、`总结`、`分析`
 - `/status`
 
+`/status` 会优先显示持续 bot 写入的真实运行状态。如果还没有持续 bot
+运行态，就回退显示 Telegram listener 自己读取到的 `.env` 配置。
+
 ---
 
 ## 支持的交易对
