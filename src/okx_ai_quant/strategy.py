@@ -1,0 +1,623 @@
+from dataclasses import dataclass
+from datetime import UTC, datetime
+
+import pandas as pd
+
+from okx_ai_quant.indicators import atr, ema, rsi
+from okx_ai_quant.models import Candle, Signal, SignalDirection
+
+AVAILABLE_STRATEGIES = (
+    "ema-rsi-atr",
+    "rsi-bollinger-reversion",
+    "donchian-breakout",
+    "ema-momentum",
+    "multi-timeframe-trend",
+    "volatility-adjusted-momentum",
+)
+
+
+@dataclass(frozen=True, kw_only=True)
+class StrategySignal(Signal):
+    expected_move: float = 0.0
+    entry_price: float | None = None
+    stop_price: float | None = None
+    target_price: float | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class EmaRsiAtrStrategy:
+    min_expected_move: float
+    fast_span: int = 12
+    slow_span: int = 26
+    rsi_period: int = 14
+    atr_period: int = 14
+
+    def generate(
+        self,
+        symbol: str,
+        one_hour: list[Candle],
+        four_hour: list[Candle],
+    ) -> Signal:
+        required_candles = max(self.slow_span, self.rsi_period + 1, self.atr_period)
+        if len(one_hour) < required_candles or len(four_hour) < required_candles:
+            return self._hold(
+                symbol,
+                "Not enough candles for EMA, RSI, and ATR calculations.",
+            )
+
+        one_hour_frame = self._frame(one_hour)
+        four_hour_frame = self._frame(four_hour)
+
+        one_hour_fast = ema(one_hour_frame["close"], self.fast_span)
+        one_hour_slow = ema(one_hour_frame["close"], self.slow_span)
+        four_hour_fast = ema(four_hour_frame["close"], self.fast_span)
+        four_hour_slow = ema(four_hour_frame["close"], self.slow_span)
+        one_hour_rsi = rsi(one_hour_frame["close"], self.rsi_period).iloc[-1]
+        one_hour_atr = atr(one_hour_frame, self.atr_period).iloc[-1]
+        latest_close = float(one_hour_frame["close"].iloc[-1])
+
+        if pd.isna(one_hour_rsi) or pd.isna(one_hour_atr) or latest_close <= 0:
+            return self._hold(symbol, "Not enough candles for stable indicator values.")
+
+        one_hour_uptrend = one_hour_fast.iloc[-1] > one_hour_slow.iloc[-1]
+        four_hour_uptrend = four_hour_fast.iloc[-1] > four_hour_slow.iloc[-1]
+        one_hour_downtrend = one_hour_fast.iloc[-1] < one_hour_slow.iloc[-1]
+        four_hour_downtrend = four_hour_fast.iloc[-1] < four_hour_slow.iloc[-1]
+
+        expected_move = float((one_hour_atr * 1.5) / latest_close)
+        if expected_move < self.min_expected_move:
+            return self._hold(
+                symbol,
+                f"Expected move {expected_move:.4f} is below minimum {self.min_expected_move:.4f}.",
+                expected_move=expected_move,
+            )
+
+        if four_hour_uptrend and one_hour_uptrend and one_hour_rsi >= 50.0:
+            return self._signal(
+                symbol=symbol,
+                direction=SignalDirection.LONG,
+                confidence=self._confidence(one_hour_rsi, expected_move),
+                reason="4H and 1H EMA uptrend aligned with acceptable RSI.",
+                expected_move=expected_move,
+                entry_price=latest_close,
+                stop_price=latest_close - float(one_hour_atr),
+                target_price=latest_close + float(one_hour_atr * 1.5),
+            )
+
+        if four_hour_downtrend and one_hour_downtrend and one_hour_rsi <= 50.0:
+            return self._signal(
+                symbol=symbol,
+                direction=SignalDirection.SHORT,
+                confidence=self._confidence(100.0 - one_hour_rsi, expected_move),
+                reason="4H and 1H EMA downtrend aligned with acceptable RSI.",
+                expected_move=expected_move,
+                entry_price=latest_close,
+                stop_price=latest_close + float(one_hour_atr),
+                target_price=latest_close - float(one_hour_atr * 1.5),
+            )
+
+        return self._hold(
+            symbol,
+            "4H trend filter and 1H signal conditions are not aligned.",
+            expected_move=expected_move,
+        )
+
+    def _signal(
+        self,
+        *,
+        symbol: str,
+        direction: SignalDirection,
+        confidence: float,
+        reason: str,
+        expected_move: float,
+        entry_price: float,
+        stop_price: float,
+        target_price: float,
+    ) -> StrategySignal:
+        return StrategySignal(
+            symbol=symbol,
+            timeframe="1H",
+            direction=direction,
+            confidence=confidence,
+            reason=reason,
+            created_at=datetime.now(UTC),
+            expected_move=expected_move,
+            entry_price=entry_price,
+            stop_price=stop_price,
+            target_price=target_price,
+        )
+
+    def _hold(
+        self,
+        symbol: str,
+        reason: str,
+        *,
+        expected_move: float = 0.0,
+    ) -> StrategySignal:
+        return StrategySignal(
+            symbol=symbol,
+            timeframe="1H",
+            direction=SignalDirection.HOLD,
+            confidence=0.0,
+            reason=reason,
+            created_at=datetime.now(UTC),
+            expected_move=expected_move,
+            stop_price=None,
+            target_price=None,
+        )
+
+    @staticmethod
+    def _frame(candles: list[Candle]) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "high": [candle.high for candle in candles],
+                "low": [candle.low for candle in candles],
+                "close": [candle.close for candle in candles],
+            }
+        )
+
+    @staticmethod
+    def _confidence(rsi_strength: float, expected_move: float) -> float:
+        rsi_component = min(abs(rsi_strength - 50.0) / 50.0, 1.0)
+        move_component = min(expected_move * 10.0, 1.0)
+        return round(0.5 + (0.3 * rsi_component) + (0.2 * move_component), 4)
+
+
+@dataclass(frozen=True, kw_only=True)
+class RsiBollingerReversionStrategy:
+    min_expected_move: float
+    period: int = 20
+    std_multiplier: float = 2.0
+    rsi_period: int = 14
+    atr_period: int = 14
+    oversold: float = 35.0
+    overbought: float = 65.0
+
+    def generate(
+        self,
+        symbol: str,
+        one_hour: list[Candle],
+        four_hour: list[Candle],
+    ) -> Signal:
+        del four_hour
+        required_candles = max(self.period, self.rsi_period + 1, self.atr_period)
+        if len(one_hour) < required_candles:
+            return _hold(symbol, "Not enough candles for RSI/Bollinger mean reversion.")
+
+        frame = _frame(one_hour)
+        close = frame["close"]
+        latest_close = float(close.iloc[-1])
+        moving_average = close.rolling(window=self.period, min_periods=self.period).mean()
+        moving_std = close.rolling(window=self.period, min_periods=self.period).std(ddof=0)
+        latest_mean = float(moving_average.iloc[-1])
+        latest_std = float(moving_std.iloc[-1])
+        latest_rsi = rsi(close, self.rsi_period).iloc[-1]
+        latest_atr = atr(frame, self.atr_period).iloc[-1]
+
+        if (
+            pd.isna(latest_mean)
+            or pd.isna(latest_std)
+            or pd.isna(latest_rsi)
+            or pd.isna(latest_atr)
+            or latest_close <= 0
+        ):
+            return _hold(symbol, "Not enough candles for stable mean reversion values.")
+
+        upper_band = latest_mean + (self.std_multiplier * latest_std)
+        lower_band = latest_mean - (self.std_multiplier * latest_std)
+        expected_move = abs(latest_mean - latest_close) / latest_close
+        if expected_move < self.min_expected_move:
+            return _hold(
+                symbol,
+                f"Expected move {expected_move:.4f} is below minimum {self.min_expected_move:.4f}.",
+                expected_move=expected_move,
+            )
+
+        if latest_close <= lower_band and latest_rsi <= self.oversold:
+            return _signal(
+                symbol=symbol,
+                direction=SignalDirection.LONG,
+                confidence=_bounded_confidence(0.55 + expected_move),
+                reason="RSI/Bollinger mean reversion long: price is near the lower band and RSI is oversold.",
+                expected_move=expected_move,
+                entry_price=latest_close,
+                stop_price=latest_close - float(latest_atr),
+                target_price=latest_mean,
+            )
+
+        if latest_close >= upper_band and latest_rsi >= self.overbought:
+            return _signal(
+                symbol=symbol,
+                direction=SignalDirection.SHORT,
+                confidence=_bounded_confidence(0.55 + expected_move),
+                reason="RSI/Bollinger mean reversion short: price is near the upper band and RSI is overbought.",
+                expected_move=expected_move,
+                entry_price=latest_close,
+                stop_price=latest_close + float(latest_atr),
+                target_price=latest_mean,
+            )
+
+        return _hold(
+            symbol,
+            "RSI/Bollinger mean reversion conditions are not aligned.",
+            expected_move=expected_move,
+        )
+
+
+@dataclass(frozen=True, kw_only=True)
+class DonchianBreakoutStrategy:
+    min_expected_move: float
+    lookback: int = 20
+    atr_period: int = 14
+
+    def generate(
+        self,
+        symbol: str,
+        one_hour: list[Candle],
+        four_hour: list[Candle],
+    ) -> Signal:
+        required_candles = max(self.lookback + 1, self.atr_period)
+        if len(one_hour) < required_candles or len(four_hour) < 26:
+            return _hold(symbol, "Not enough candles for Donchian breakout.")
+
+        one = _frame(one_hour)
+        four = _frame(four_hour)
+        latest_close = float(one["close"].iloc[-1])
+        latest_atr = atr(one, self.atr_period).iloc[-1]
+        previous_window = one.iloc[-self.lookback - 1 : -1]
+        channel_high = float(previous_window["high"].max())
+        channel_low = float(previous_window["low"].min())
+        four_fast = ema(four["close"], 12).iloc[-1]
+        four_slow = ema(four["close"], 26).iloc[-1]
+
+        if pd.isna(latest_atr) or latest_close <= 0:
+            return _hold(symbol, "Not enough candles for stable Donchian values.")
+
+        if latest_close > channel_high and four_fast > four_slow:
+            expected_move = (latest_close - channel_high + float(latest_atr)) / latest_close
+            if expected_move < self.min_expected_move:
+                return _hold(symbol, "Donchian breakout move is below cost threshold.", expected_move=expected_move)
+            return _signal(
+                symbol=symbol,
+                direction=SignalDirection.LONG,
+                confidence=_bounded_confidence(0.55 + expected_move),
+                reason="Donchian breakout long: price broke above the recent channel high.",
+                expected_move=expected_move,
+                entry_price=latest_close,
+                stop_price=channel_high - float(latest_atr),
+                target_price=latest_close + float(latest_atr * 1.5),
+            )
+
+        if latest_close < channel_low and four_fast < four_slow:
+            expected_move = (channel_low - latest_close + float(latest_atr)) / latest_close
+            if expected_move < self.min_expected_move:
+                return _hold(symbol, "Donchian breakdown move is below cost threshold.", expected_move=expected_move)
+            return _signal(
+                symbol=symbol,
+                direction=SignalDirection.SHORT,
+                confidence=_bounded_confidence(0.55 + expected_move),
+                reason="Donchian breakdown short: price broke below the recent channel low.",
+                expected_move=expected_move,
+                entry_price=latest_close,
+                stop_price=channel_low + float(latest_atr),
+                target_price=latest_close - float(latest_atr * 1.5),
+            )
+
+        return _hold(symbol, "Donchian channel breakout conditions are not aligned.")
+
+
+@dataclass(frozen=True, kw_only=True)
+class EmaMomentumStrategy:
+    min_expected_move: float
+    fast_span: int = 12
+    slow_span: int = 26
+    momentum_lookback: int = 6
+    atr_period: int = 14
+
+    def generate(
+        self,
+        symbol: str,
+        one_hour: list[Candle],
+        four_hour: list[Candle],
+    ) -> Signal:
+        del four_hour
+        required_candles = max(self.slow_span, self.momentum_lookback + 1, self.atr_period)
+        if len(one_hour) < required_candles:
+            return _hold(symbol, "Not enough candles for EMA momentum.")
+
+        frame = _frame(one_hour)
+        close = frame["close"]
+        latest_close = float(close.iloc[-1])
+        lookback_close = float(close.iloc[-self.momentum_lookback - 1])
+        fast = ema(close, self.fast_span).iloc[-1]
+        slow = ema(close, self.slow_span).iloc[-1]
+        latest_atr = atr(frame, self.atr_period).iloc[-1]
+
+        if pd.isna(fast) or pd.isna(slow) or pd.isna(latest_atr) or latest_close <= 0 or lookback_close <= 0:
+            return _hold(symbol, "Not enough candles for stable EMA momentum values.")
+
+        momentum = (latest_close / lookback_close) - 1.0
+        expected_move = max(abs(momentum), float(latest_atr / latest_close))
+        if expected_move < self.min_expected_move:
+            return _hold(
+                symbol,
+                f"Momentum move {expected_move:.4f} is below minimum {self.min_expected_move:.4f}.",
+                expected_move=expected_move,
+            )
+
+        if fast > slow and momentum > 0:
+            return _signal(
+                symbol=symbol,
+                direction=SignalDirection.LONG,
+                confidence=_bounded_confidence(0.55 + abs(momentum)),
+                reason="EMA momentum long: EMA trend is positive and recent momentum is rising.",
+                expected_move=expected_move,
+                entry_price=latest_close,
+                stop_price=latest_close - float(latest_atr),
+                target_price=latest_close + float(latest_atr * 1.5),
+            )
+
+        if fast < slow and momentum < 0:
+            return _signal(
+                symbol=symbol,
+                direction=SignalDirection.SHORT,
+                confidence=_bounded_confidence(0.55 + abs(momentum)),
+                reason="EMA momentum short: EMA trend is negative and recent momentum is falling.",
+                expected_move=expected_move,
+                entry_price=latest_close,
+                stop_price=latest_close + float(latest_atr),
+                target_price=latest_close - float(latest_atr * 1.5),
+            )
+
+        return _hold(symbol, "EMA momentum conditions are not aligned.", expected_move=expected_move)
+
+
+@dataclass(frozen=True, kw_only=True)
+class MultiTimeframeTrendStrategy:
+    min_expected_move: float
+    fast_span: int = 12
+    medium_span: int = 26
+    slow_span: int = 50
+    rsi_period: int = 14
+    atr_period: int = 14
+    min_trend_gap: float = 0.002
+
+    def generate(
+        self,
+        symbol: str,
+        one_hour: list[Candle],
+        four_hour: list[Candle],
+    ) -> Signal:
+        required_candles = max(self.slow_span + 1, self.rsi_period + 1, self.atr_period)
+        if len(one_hour) < required_candles or len(four_hour) < required_candles:
+            return _hold(symbol, "Not enough candles for multi-timeframe trend.")
+
+        one = _frame(one_hour)
+        four = _frame(four_hour)
+        close = one["close"]
+        latest_close = float(close.iloc[-1])
+        latest_atr = atr(one, self.atr_period).iloc[-1]
+        latest_rsi = rsi(close, self.rsi_period).iloc[-1]
+        if pd.isna(latest_atr) or pd.isna(latest_rsi) or latest_close <= 0:
+            return _hold(symbol, "Not enough candles for stable multi-timeframe trend values.")
+
+        one_fast = ema(close, self.fast_span).iloc[-1]
+        one_medium = ema(close, self.medium_span).iloc[-1]
+        one_slow = ema(close, self.slow_span).iloc[-1]
+        four_fast_series = ema(four["close"], self.fast_span)
+        four_medium = ema(four["close"], self.medium_span).iloc[-1]
+        four_slow = ema(four["close"], self.slow_span).iloc[-1]
+        four_fast = four_fast_series.iloc[-1]
+        previous_four_fast = four_fast_series.iloc[-2]
+
+        expected_move = float(max((latest_atr * 1.8) / latest_close, abs(one_fast - one_slow) / latest_close))
+        if expected_move < self.min_expected_move:
+            return _hold(
+                symbol,
+                f"Trend expected move {expected_move:.4f} is below minimum {self.min_expected_move:.4f}.",
+                expected_move=expected_move,
+            )
+
+        one_up = one_fast > one_medium > one_slow and latest_close > one_medium
+        four_up = four_fast > four_medium > four_slow and four_fast > previous_four_fast
+        one_down = one_fast < one_medium < one_slow and latest_close < one_medium
+        four_down = four_fast < four_medium < four_slow and four_fast < previous_four_fast
+        trend_gap = abs(one_fast - one_slow) / latest_close
+
+        if trend_gap < self.min_trend_gap:
+            return _hold(
+                symbol,
+                f"Trend gap {trend_gap:.4f} is below minimum {self.min_trend_gap:.4f}.",
+                expected_move=expected_move,
+            )
+
+        if four_up and one_up and 45.0 <= latest_rsi <= 72.0:
+            return _signal(
+                symbol=symbol,
+                direction=SignalDirection.LONG,
+                confidence=_bounded_confidence(0.58 + trend_gap * 8 + expected_move),
+                reason="Multi-timeframe trend long: 4H and 1H EMA stacks are aligned upward with healthy RSI.",
+                expected_move=expected_move,
+                entry_price=latest_close,
+                stop_price=latest_close - float(latest_atr * 1.2),
+                target_price=latest_close + float(latest_atr * 2.0),
+            )
+
+        if four_down and one_down and 28.0 <= latest_rsi <= 55.0:
+            return _signal(
+                symbol=symbol,
+                direction=SignalDirection.SHORT,
+                confidence=_bounded_confidence(0.58 + trend_gap * 8 + expected_move),
+                reason="Multi-timeframe trend short: 4H and 1H EMA stacks are aligned downward with healthy RSI.",
+                expected_move=expected_move,
+                entry_price=latest_close,
+                stop_price=latest_close + float(latest_atr * 1.2),
+                target_price=latest_close - float(latest_atr * 2.0),
+            )
+
+        return _hold(
+            symbol,
+            "Multi-timeframe trend conditions are not aligned.",
+            expected_move=expected_move,
+        )
+
+
+@dataclass(frozen=True, kw_only=True)
+class VolatilityAdjustedMomentumStrategy:
+    min_expected_move: float
+    fast_span: int = 8
+    slow_span: int = 21
+    momentum_lookback: int = 12
+    atr_period: int = 14
+    min_momentum_to_atr: float = 1.25
+
+    def generate(
+        self,
+        symbol: str,
+        one_hour: list[Candle],
+        four_hour: list[Candle],
+    ) -> Signal:
+        del four_hour
+        required_candles = max(self.slow_span + 1, self.momentum_lookback + 1, self.atr_period)
+        if len(one_hour) < required_candles:
+            return _hold(symbol, "Not enough candles for volatility-adjusted momentum.")
+
+        frame = _frame(one_hour)
+        close = frame["close"]
+        latest_close = float(close.iloc[-1])
+        lookback_close = float(close.iloc[-self.momentum_lookback - 1])
+        latest_atr = atr(frame, self.atr_period).iloc[-1]
+        fast = ema(close, self.fast_span).iloc[-1]
+        slow = ema(close, self.slow_span).iloc[-1]
+        previous_fast = ema(close.iloc[:-1], self.fast_span).iloc[-1]
+
+        if (
+            pd.isna(latest_atr)
+            or pd.isna(fast)
+            or pd.isna(slow)
+            or latest_close <= 0
+            or lookback_close <= 0
+        ):
+            return _hold(symbol, "Not enough candles for stable volatility-adjusted momentum values.")
+
+        momentum = (latest_close / lookback_close) - 1.0
+        atr_rate = float(latest_atr / latest_close)
+        momentum_to_atr = abs(momentum) / atr_rate if atr_rate > 0 else 0.0
+        expected_move = max(abs(momentum), atr_rate)
+
+        if expected_move < self.min_expected_move:
+            return _hold(
+                symbol,
+                f"Volatility-adjusted momentum {expected_move:.4f} is below minimum {self.min_expected_move:.4f}.",
+                expected_move=expected_move,
+            )
+        if momentum_to_atr < self.min_momentum_to_atr:
+            return _hold(
+                symbol,
+                f"Momentum/ATR ratio {momentum_to_atr:.2f} is below minimum {self.min_momentum_to_atr:.2f}.",
+                expected_move=expected_move,
+            )
+
+        fast_rising = fast > previous_fast
+        fast_falling = fast < previous_fast
+        if fast > slow and fast_rising and momentum > 0:
+            return _signal(
+                symbol=symbol,
+                direction=SignalDirection.LONG,
+                confidence=_bounded_confidence(0.55 + min(momentum_to_atr, 3.0) * 0.08),
+                reason="Volatility-adjusted momentum long: positive momentum clears ATR noise and EMA slope is rising.",
+                expected_move=expected_move,
+                entry_price=latest_close,
+                stop_price=latest_close - float(latest_atr * 1.1),
+                target_price=latest_close + float(latest_atr * 1.8),
+            )
+
+        if fast < slow and fast_falling and momentum < 0:
+            return _signal(
+                symbol=symbol,
+                direction=SignalDirection.SHORT,
+                confidence=_bounded_confidence(0.55 + min(momentum_to_atr, 3.0) * 0.08),
+                reason="Volatility-adjusted momentum short: negative momentum clears ATR noise and EMA slope is falling.",
+                expected_move=expected_move,
+                entry_price=latest_close,
+                stop_price=latest_close + float(latest_atr * 1.1),
+                target_price=latest_close - float(latest_atr * 1.8),
+            )
+
+        return _hold(
+            symbol,
+            "Volatility-adjusted momentum conditions are not aligned.",
+            expected_move=expected_move,
+        )
+
+
+def create_strategy(name: str, *, min_expected_move: float):
+    match name:
+        case "ema-rsi-atr":
+            return EmaRsiAtrStrategy(min_expected_move=min_expected_move)
+        case "rsi-bollinger-reversion":
+            return RsiBollingerReversionStrategy(min_expected_move=min_expected_move)
+        case "donchian-breakout":
+            return DonchianBreakoutStrategy(min_expected_move=min_expected_move)
+        case "ema-momentum":
+            return EmaMomentumStrategy(min_expected_move=min_expected_move)
+        case "multi-timeframe-trend":
+            return MultiTimeframeTrendStrategy(min_expected_move=min_expected_move)
+        case "volatility-adjusted-momentum":
+            return VolatilityAdjustedMomentumStrategy(min_expected_move=min_expected_move)
+        case _:
+            choices = ", ".join(AVAILABLE_STRATEGIES)
+            raise ValueError(f"Unknown strategy {name!r}. Choose one of: {choices}")
+
+
+def _frame(candles: list[Candle]) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "high": [candle.high for candle in candles],
+            "low": [candle.low for candle in candles],
+            "close": [candle.close for candle in candles],
+        }
+    )
+
+
+def _signal(
+    *,
+    symbol: str,
+    direction: SignalDirection,
+    confidence: float,
+    reason: str,
+    expected_move: float,
+    entry_price: float,
+    stop_price: float,
+    target_price: float,
+) -> StrategySignal:
+    return StrategySignal(
+        symbol=symbol,
+        timeframe="1H",
+        direction=direction,
+        confidence=confidence,
+        reason=reason,
+        created_at=datetime.now(UTC),
+        expected_move=expected_move,
+        entry_price=entry_price,
+        stop_price=stop_price,
+        target_price=target_price,
+    )
+
+
+def _hold(symbol: str, reason: str, *, expected_move: float = 0.0) -> StrategySignal:
+    return StrategySignal(
+        symbol=symbol,
+        timeframe="1H",
+        direction=SignalDirection.HOLD,
+        confidence=0.0,
+        reason=reason,
+        created_at=datetime.now(UTC),
+        expected_move=expected_move,
+        stop_price=None,
+        target_price=None,
+    )
+
+
+def _bounded_confidence(value: float) -> float:
+    return round(max(0.0, min(value, 0.95)), 4)
