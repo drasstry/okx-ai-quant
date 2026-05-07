@@ -1,7 +1,7 @@
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
-from okx_ai_quant.bot import TradingBot
+from okx_ai_quant.bot import TradingBot, _daily_report_key, _due_report_slots
 from okx_ai_quant.config import Settings
 from okx_ai_quant.execution import ExecutionEngine
 from okx_ai_quant.models import (
@@ -265,3 +265,21 @@ def test_bot_filters_symbols_not_available_in_okx_environment(tmp_path):
     results = bot.run_once()
 
     assert [result.symbol for result in results] == ["BTC-USDT-SWAP"]
+
+
+def test_due_report_slots_include_missed_times_without_future_times():
+    now = datetime(2026, 5, 7, 8, 3, tzinfo=UTC)
+
+    assert _due_report_slots(now, ["00:00", "08:00", "12:00", "bad"]) == ["00:00", "08:00"]
+
+
+def test_scheduled_report_slot_does_not_conflict_with_manual_report(tmp_path):
+    bot, _client = _bot(tmp_path, enable_trading=False)
+    report_date = date(2026, 5, 7)
+
+    assert bot.send_daily_report(report_date, force=True)
+    assert bot.send_daily_report(report_date, report_slot="08:00")
+    assert not bot.send_daily_report(report_date, report_slot="08:00")
+
+    assert bot.runner.storage.daily_report_exists(_daily_report_key(report_date))
+    assert bot.runner.storage.daily_report_exists(_daily_report_key(report_date, "08:00"))

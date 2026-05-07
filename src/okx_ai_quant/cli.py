@@ -1,5 +1,7 @@
 import argparse
+import time
 from collections.abc import Sequence
+from datetime import UTC, datetime
 
 from okx_ai_quant.analysis import TradeAnalysisGenerator
 from okx_ai_quant.bot import TradingBot
@@ -7,7 +9,7 @@ from okx_ai_quant.config import Settings, TradingMode
 from okx_ai_quant.cost import CostModel
 from okx_ai_quant.execution import ExecutionEngine
 from okx_ai_quant.llm import OpenAICompatibleLLMClient
-from okx_ai_quant.notifier import build_notifier
+from okx_ai_quant.notifier import NotificationError, TelegramBotClient, build_notifier
 from okx_ai_quant.okx_client import OkxClient
 from okx_ai_quant.risk import RiskGuard
 from okx_ai_quant.runner import Runner
@@ -85,6 +87,62 @@ def build_bot(*, mode: str | None = None, settings_overrides: dict | None = None
         enable_trading=False,
     )
     return TradingBot(settings=settings, runner=runner, notifier=build_notifier(settings))
+
+
+def run_telegram_listener(*, mode: str | None = None, timeout: int = 25) -> None:
+    settings_overrides = {"NOTIFIER": "telegram"}
+    if mode is not None:
+        settings_overrides["TRADING_MODE"] = mode
+    bot = build_bot(settings_overrides=settings_overrides)
+    client = TelegramBotClient(
+        bot_token=bot.settings.TELEGRAM_BOT_TOKEN,
+        chat_id=bot.settings.TELEGRAM_CHAT_ID,
+    )
+    try:
+        raw_offset = bot.runner.storage.get_state("telegram:last_update_id")
+        offset = int(raw_offset) + 1 if raw_offset is not None else None
+        client.send(
+            "OKX AI Quant Telegram listener started. "
+            "Send /report, 日报, 总结, or /status."
+        )
+        while True:
+            try:
+                updates = client.get_updates(offset=offset, timeout=timeout)
+            except NotificationError as exc:
+                print(exc)
+                time.sleep(5)
+                continue
+
+            for update in updates:
+                offset = update.update_id + 1
+                bot.runner.storage.set_state(
+                    "telegram:last_update_id",
+                    str(update.update_id),
+                    datetime.now(UTC),
+                )
+                _handle_telegram_text(bot, client, update.text)
+    finally:
+        _close_if_possible(bot.runner)
+
+
+def _handle_telegram_text(bot: TradingBot, client: TelegramBotClient, text: str) -> None:
+    normalized = text.strip().lower()
+    command = normalized.split(maxsplit=1)[0].split("@", maxsplit=1)[0]
+    if command in {"/report", "/daily", "/summary"} or any(
+        keyword in normalized for keyword in ("日报", "报告", "总结", "分析")
+    ):
+        bot.send_daily_report(force=True)
+        return
+    if command == "/status":
+        client.send(
+            "OKX AI Quant status\n"
+            f"mode={bot.settings.TRADING_MODE}\n"
+            f"trading={bot.settings.ENABLE_TRADING}\n"
+            f"strategy={bot.settings.STRATEGY_NAME}\n"
+            f"symbols={', '.join(bot.settings.symbols)}"
+        )
+        return
+    client.send("Supported commands: /report, 日报, 总结, /status")
 
 
 def _prompt_choice(prompt: str, choices: Sequence[str], *, default: str | None = None) -> str:
@@ -522,6 +580,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Override trading mode for report generation",
     )
 
+    telegram = subparsers.add_parser(
+        "telegram-listen",
+        help="Listen for Telegram commands such as /report and /status",
+    )
+    telegram.add_argument(
+        "--mode",
+        choices=[TradingMode.DEMO.value, TradingMode.LIVE.value],
+        default=None,
+        help="Override trading mode for Telegram-triggered reports",
+    )
+    telegram.add_argument(
+        "--timeout",
+        type=int,
+        default=25,
+        help="Telegram long-poll timeout in seconds",
+    )
+
     subparsers.add_parser("wizard", help="Choose mode, strategy, symbol, and leverage interactively")
     subparsers.add_parser("menu", help="Open the interactive bot control menu")
 
@@ -553,6 +628,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             bot.send_daily_report(force=True)
         finally:
             _close_if_possible(bot.runner)
+    elif args.command == "telegram-listen":
+        run_telegram_listener(mode=args.mode, timeout=args.timeout)
     elif args.command == "wizard":
         return run_wizard()
     elif args.command == "menu":

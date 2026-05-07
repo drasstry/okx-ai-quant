@@ -1,7 +1,7 @@
 import json
 import time
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time as dt_time, timedelta
 from zoneinfo import ZoneInfo
 
 from okx_ai_quant.account import AccountService
@@ -109,14 +109,26 @@ class TradingBot:
         return self._tradable_symbols_cache
 
     def maybe_send_daily_report(self) -> bool:
-        today = datetime.now(self.tz).date()
-        if not _is_report_due(datetime.now(self.tz), self.settings.report_times):
-            return False
-        return self.send_daily_report(today)
+        now = datetime.now(self.tz)
+        sent = False
+        for report_slot in _due_report_slots(now, self.settings.report_times):
+            state_key = _report_slot_state_key(now.date(), report_slot)
+            if self.runner.storage.get_state(state_key):
+                continue
+            if self.send_daily_report(now.date(), report_slot=report_slot):
+                self.runner.storage.set_state(state_key, "sent", datetime.now(UTC))
+                sent = True
+        return sent
 
-    def send_daily_report(self, report_date: date | None = None, *, force: bool = False) -> bool:
+    def send_daily_report(
+        self,
+        report_date: date | None = None,
+        *,
+        force: bool = False,
+        report_slot: str | None = None,
+    ) -> bool:
         report_date = report_date or datetime.now(self.tz).date()
-        report_key = report_date.isoformat()
+        report_key = _daily_report_key(report_date, report_slot)
         storage = self.runner.storage
         if storage.daily_report_exists(report_key) and not force:
             return False
@@ -518,9 +530,37 @@ def _map_okx_order_state(value: object) -> OrderState | None:
     return None
 
 
-def _is_report_due(now: datetime, report_times: list[str]) -> bool:
-    current = f"{now.hour:02d}:{now.minute:02d}"
-    return current in set(report_times)
+def _due_report_slots(now: datetime, report_times: list[str]) -> list[str]:
+    due_slots: list[str] = []
+    for report_time in report_times:
+        scheduled = _parse_report_time(report_time)
+        if scheduled is None:
+            continue
+        if now.timetz().replace(tzinfo=None) >= scheduled:
+            due_slots.append(f"{scheduled.hour:02d}:{scheduled.minute:02d}")
+    return due_slots
+
+
+def _parse_report_time(value: str) -> dt_time | None:
+    try:
+        hour_text, minute_text = value.strip().split(":", maxsplit=1)
+        hour = int(hour_text)
+        minute = int(minute_text)
+    except ValueError:
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return dt_time(hour=hour, minute=minute)
+
+
+def _daily_report_key(report_date: date, report_slot: str | None = None) -> str:
+    if report_slot is None:
+        return report_date.isoformat()
+    return f"{report_date.isoformat()}:{report_slot}"
+
+
+def _report_slot_state_key(report_date: date, report_slot: str) -> str:
+    return f"daily_report_sent:{report_date.isoformat()}:{report_slot}"
 
 
 def _float(value: object) -> float:

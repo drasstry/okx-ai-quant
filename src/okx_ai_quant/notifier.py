@@ -3,6 +3,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 from okx_ai_quant.config import Settings
 
@@ -58,6 +59,52 @@ class TelegramNotifier(Notifier):
 
         if not raw.get("ok"):
             raise NotificationError(f"Telegram send failed: {raw}")
+
+
+@dataclass(frozen=True, kw_only=True)
+class TelegramUpdate:
+    update_id: int
+    chat_id: str
+    text: str
+
+
+class TelegramBotClient:
+    def __init__(self, *, bot_token: str, chat_id: str) -> None:
+        self.bot_token = bot_token
+        self.chat_id = chat_id
+
+    def get_updates(self, *, offset: int | None = None, timeout: int = 25) -> list[TelegramUpdate]:
+        if not self.bot_token or not self.chat_id:
+            raise NotificationError("Telegram polling requires TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
+
+        params = {"timeout": str(timeout), "allowed_updates": json.dumps(["message"])}
+        if offset is not None:
+            params["offset"] = str(offset)
+        url = f"https://api.telegram.org/bot{self.bot_token}/getUpdates?{urllib.parse.urlencode(params)}"
+        request = urllib.request.Request(url, method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=timeout + 5) as response:
+                raw = json.loads(response.read().decode("utf-8"))
+        except (urllib.error.HTTPError, urllib.error.URLError) as exc:
+            raise NotificationError(f"Telegram polling failed: {exc}") from exc
+
+        if not raw.get("ok"):
+            raise NotificationError(f"Telegram polling failed: {raw}")
+
+        updates: list[TelegramUpdate] = []
+        for row in raw.get("result") or []:
+            message = row.get("message") or {}
+            chat = message.get("chat") or {}
+            chat_id = str(chat.get("id") or "")
+            text = str(message.get("text") or "").strip()
+            update_id = row.get("update_id")
+            if chat_id != str(self.chat_id) or not text or not isinstance(update_id, int):
+                continue
+            updates.append(TelegramUpdate(update_id=update_id, chat_id=chat_id, text=text))
+        return updates
+
+    def send(self, message: str) -> None:
+        TelegramNotifier(bot_token=self.bot_token, chat_id=self.chat_id).send(message)
 
 
 def build_notifier(settings: Settings) -> Notifier:

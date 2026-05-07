@@ -375,6 +375,20 @@ uv run okx-ai-quant report-now --mode demo
 ```
 
 持续 bot 会在 `REPORT_TIMES` 指定的时间自动推送报告。
+每个时间点会独立记录发送状态，所以 `00:00,08:00,12:00,20:00`
+每天最多可以发送四次。如果 bot 循环晚了几分钟醒来，会对错过的时间点补发一次，并记录该时间点已发送。
+
+也可以让 Telegram 主动触发报告：
+
+```bash
+uv run okx-ai-quant telegram-listen --mode demo
+```
+
+支持的 Telegram 消息：
+
+- `/report`、`/daily`、`/summary`
+- `日报`、`报告`、`总结`、`分析`
+- `/status`
 
 ---
 

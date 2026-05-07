@@ -365,6 +365,21 @@ uv run okx-ai-quant report-now --mode demo
 ```
 
 Scheduled reports are sent by the long-running bot at `REPORT_TIMES`.
+Each configured time is tracked independently, so `00:00,08:00,12:00,20:00`
+can send up to four reports per day. If the bot loop wakes a few minutes late,
+it sends the missed slot once and records it as sent.
+
+You can also let Telegram trigger reports on demand:
+
+```bash
+uv run okx-ai-quant telegram-listen --mode demo
+```
+
+Supported Telegram messages:
+
+- `/report`, `/daily`, `/summary`
+- `日报`, `报告`, `总结`, `分析`
+- `/status`
 
 ---
 
