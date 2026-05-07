@@ -67,6 +67,23 @@ class OkxClient:
         self._raise_for_error(response)
         return response
 
+    def get_positions(
+        self,
+        *,
+        inst_type: str | None = None,
+        symbol: str | None = None,
+    ) -> dict[str, Any]:
+        if self.account_api is None:
+            raise RuntimeError("OKX account API is not configured")
+        kwargs = {}
+        if inst_type:
+            kwargs["instType"] = inst_type
+        if symbol:
+            kwargs["instId"] = symbol
+        response = self.account_api.get_positions(**kwargs)
+        self._raise_for_error(response)
+        return response
+
     def get_order(
         self,
         symbol: str,

@@ -76,7 +76,7 @@ class TradingBot:
             self.sweep_stale_orders()
         except Exception:
             pass
-        self._snapshot_balances()
+        self.reconcile_exchange_state()
         if self.settings.MANAGE_EXISTING_POSITIONS:
             self.monitor_positions()
 
@@ -332,6 +332,48 @@ class TradingBot:
         now = datetime.now(UTC)
         for snapshot in summary.balance_snapshots(now):
             self.runner.storage.upsert_balance(snapshot)
+
+    def reconcile_exchange_state(self) -> None:
+        self._snapshot_balances()
+        try:
+            exchange_positions = self.account.fetch_positions()
+        except Exception as exc:
+            self._notify(f"Could not reconcile OKX positions: {exc}")
+            return
+
+        allowed_symbols = set(self.settings.symbols)
+        seen_symbols: set[str] = set()
+        now = datetime.now(UTC)
+        for exchange_position in exchange_positions:
+            if exchange_position.symbol not in allowed_symbols:
+                continue
+            if exchange_position.average_entry <= 0:
+                continue
+
+            local = self.runner.storage.load_position(exchange_position.symbol)
+            seen_symbols.add(exchange_position.symbol)
+            self.runner.storage.upsert_position(
+                symbol=exchange_position.symbol,
+                side=exchange_position.side,
+                quantity=exchange_position.quantity,
+                average_entry=exchange_position.average_entry,
+                opened_at=local.opened_at if local is not None else exchange_position.opened_at,
+                updated_at=exchange_position.updated_at,
+                entry_signal_id=local.entry_signal_id if local is not None else None,
+                stop_loss=local.stop_loss if local is not None else None,
+                take_profit=local.take_profit if local is not None else None,
+                expires_at=local.expires_at if local is not None else None,
+            )
+
+        for local in self.runner.storage.load_open_positions():
+            if local.symbol in allowed_symbols and local.symbol not in seen_symbols:
+                self.runner.storage.close_position(
+                    symbol=local.symbol,
+                    reason=ExitReason.RISK_EXIT,
+                    exit_price=local.average_entry,
+                    closed_at=now,
+                    notes="Local position closed because OKX reported no matching open SWAP position.",
+                )
 
     def _record_filled_order(self, order: OrderRecord, data: dict[str, object]) -> None:
         fill_size = _float(data.get("accFillSz"))

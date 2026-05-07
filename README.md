@@ -45,6 +45,7 @@ The core idea is simple:
 - Generate bilingual trade analysis with deterministic fallback or an OpenAI-compatible LLM
 - Store candles, signals, risk decisions, orders, fills, positions, exits, balances, reports, and analyses in SQLite
 - Manage bot-recorded positions with stop-loss, take-profit, reverse-signal, timeout, and risk exits
+- Reconcile OKX account balances and real SWAP positions on each bot cycle
 - Run from CLI flags, an interactive wizard, or a menu-style control console
 - Push reports through console or Telegram notifications
 - Submit OKX demo orders when the account mode and API permissions allow it
@@ -317,6 +318,7 @@ By default, `run-once` follows `ENABLE_TRADING`. If you want to submit an approv
 ### What the bot does
 
 - scan every symbol in `SYMBOLS`
+- query OKX balances and real SWAP positions, then reconcile local state
 - persist candles, signals, risk decisions, analyses, orders, balances, fills, and reports
 - skip new orders when a bot order is already pending
 - avoid repeating the same signal on the same candle
@@ -325,6 +327,12 @@ By default, `run-once` follows `ENABLE_TRADING`. If you want to submit an approv
 - submit reduce-only close orders for stop-loss, take-profit, reverse-signal, timeout, or risk exits
 - record closed-position PnL and exit attribution for review
 - send reports through the configured notifier
+
+Position reconciliation treats OKX as the source of truth for real SWAP
+quantity, side, and average entry price. Local stop-loss, take-profit, timeout,
+and entry-signal metadata are preserved when a matching local position exists.
+Only symbols in `SYMBOLS` are reconciled, so unrelated manual positions are not
+automatically adopted by the bot.
 
 ### Send a report now
 

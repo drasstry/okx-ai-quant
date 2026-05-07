@@ -37,6 +37,24 @@ class FakePublicApi:
         return self.instruments_response
 
 
+class FakeAccountApi:
+    def __init__(self):
+        self.calls = []
+        self.balance_response = {"code": "0", "data": []}
+        self.positions_response = {
+            "code": "0",
+            "data": [{"instId": "BTC-USDT-SWAP", "pos": "1", "avgPx": "100"}],
+        }
+
+    def get_account_balance(self, **kwargs):
+        self.calls.append(("get_account_balance", kwargs))
+        return self.balance_response
+
+    def get_positions(self, **kwargs):
+        self.calls.append(("get_positions", kwargs))
+        return self.positions_response
+
+
 def test_client_uses_selected_demo_credentials_and_flag(monkeypatch):
     created = {}
 
@@ -121,6 +139,23 @@ def test_get_instruments_returns_public_instrument_rows():
 
     assert rows == [{"instId": "BTC-USDT-SWAP", "state": "live"}]
     assert public_api.calls == [("get_instruments", {"instType": "SWAP"})]
+
+
+def test_get_positions_passes_inst_type_and_symbol():
+    account_api = FakeAccountApi()
+    client = OkxClient(
+        settings=Settings(),
+        flag="1",
+        market_api=FakeMarketApi(),
+        account_api=account_api,
+    )
+
+    response = client.get_positions(inst_type="SWAP", symbol="BTC-USDT-SWAP")
+
+    assert response == account_api.positions_response
+    assert account_api.calls == [
+        ("get_positions", {"instType": "SWAP", "instId": "BTC-USDT-SWAP"})
+    ]
 
 
 @pytest.mark.parametrize("response", [{"code": "0"}, {"code": "0", "data": None}])

@@ -33,6 +33,7 @@ class FakeClient:
         self.order_response = {"data": []}
         self.instruments = {"data": [{"instId": "BTC-USDT-SWAP", "state": "live"}]}
         self.ticker_last = "101"
+        self.positions_response = {"data": []}
 
     def sync_server_time(self) -> int:
         return 0
@@ -65,6 +66,9 @@ class FakeClient:
                 }
             ]
         }
+
+    def get_positions(self, *, inst_type=None, symbol=None):
+        return self.positions_response
 
     def get_instruments(self, inst_type):
         return self.instruments["data"]
@@ -195,6 +199,59 @@ def test_bot_records_open_position_plan_after_entry_fill(tmp_path):
     assert position.stop_loss == 99.0
     assert position.take_profit == 105.0
     assert position.expires_at is not None
+
+
+def test_bot_reconciles_exchange_position_and_balance(tmp_path):
+    bot, client = _bot(tmp_path, enable_trading=True)
+    updated_ms = str(int(datetime(2026, 5, 7, 8, 4, tzinfo=UTC).timestamp() * 1000))
+    client.positions_response = {
+        "data": [
+            {
+                "instId": "BTC-USDT-SWAP",
+                "pos": "2",
+                "posSide": "long",
+                "avgPx": "99.5",
+                "uTime": updated_ms,
+            },
+            {
+                "instId": "ETH-USDT-SWAP",
+                "pos": "1",
+                "posSide": "long",
+                "avgPx": "3000",
+                "uTime": updated_ms,
+            },
+        ]
+    }
+
+    bot.reconcile_exchange_state()
+
+    position = bot.runner.storage.load_position("BTC-USDT-SWAP")
+    assert position is not None
+    assert position.side == SignalDirection.LONG
+    assert position.quantity == 2.0
+    assert position.average_entry == 99.5
+    assert bot.runner.storage.load_position("ETH-USDT-SWAP") is None
+    assert bot.runner.storage.load_balance("USDT").equity == 1000.0
+
+
+def test_bot_marks_local_position_closed_when_missing_on_exchange(tmp_path):
+    bot, client = _bot(tmp_path, enable_trading=True)
+    bot.runner.storage.upsert_position(
+        symbol="BTC-USDT-SWAP",
+        side=SignalDirection.LONG,
+        quantity=0.5,
+        average_entry=110.0,
+        opened_at=datetime(2026, 5, 7, 8, 0, tzinfo=UTC),
+        updated_at=datetime(2026, 5, 7, 8, 0, tzinfo=UTC),
+    )
+    client.positions_response = {"data": []}
+
+    bot.reconcile_exchange_state()
+
+    position = bot.runner.storage.load_position("BTC-USDT-SWAP")
+    exits = bot.runner.storage.load_position_exits("BTC-USDT-SWAP")
+    assert position.state == PositionState.CLOSED
+    assert exits[0].reason == ExitReason.RISK_EXIT
 
 
 def test_bot_submits_close_order_and_records_exit_on_stop_loss(tmp_path):

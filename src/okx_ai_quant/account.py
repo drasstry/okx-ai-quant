@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from okx_ai_quant.models import BalanceSnapshot
+from okx_ai_quant.models import BalanceSnapshot, PositionRecord, PositionState, SignalDirection
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -31,6 +31,12 @@ class AccountService:
 
     def fetch_summary(self) -> AccountSummary:
         return parse_balance_response(self.client.get_balance())
+
+    def fetch_positions(self) -> list[PositionRecord]:
+        get_positions = getattr(self.client, "get_positions", None)
+        if not callable(get_positions):
+            return []
+        return parse_positions_response(get_positions(inst_type="SWAP"))
 
 
 def parse_balance_response(response: dict[str, Any]) -> AccountSummary:
@@ -67,6 +73,63 @@ def parse_balance_response(response: dict[str, Any]) -> AccountSummary:
         currency_equity=currency_equity,
         currency_available=currency_available,
     )
+
+
+def parse_positions_response(response: dict[str, Any]) -> list[PositionRecord]:
+    rows = response.get("data")
+    if not isinstance(rows, list):
+        return []
+
+    positions: list[PositionRecord] = []
+    now = datetime.now(UTC)
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        symbol = str(row.get("instId") or "")
+        if not symbol:
+            continue
+
+        quantity = _float(row.get("pos"))
+        if quantity == 0:
+            continue
+
+        side = _position_side(row, quantity)
+        signed_quantity = abs(quantity) if side == SignalDirection.LONG else -abs(quantity)
+        average_entry = _float(row.get("avgPx") or row.get("openAvgPx"))
+        if average_entry <= 0:
+            average_entry = _float(row.get("markPx") or row.get("last") or row.get("lastPx"))
+
+        updated_at = _datetime_from_ms(row.get("uTime") or row.get("cTime")) or now
+        positions.append(
+            PositionRecord(
+                symbol=symbol,
+                side=side,
+                quantity=signed_quantity,
+                average_entry=average_entry,
+                state=PositionState.OPEN,
+                opened_at=updated_at,
+                updated_at=updated_at,
+            )
+        )
+    return positions
+
+
+def _position_side(row: dict[str, Any], quantity: float) -> SignalDirection:
+    pos_side = str(row.get("posSide") or "").lower()
+    if pos_side == "short":
+        return SignalDirection.SHORT
+    if pos_side == "long":
+        return SignalDirection.LONG
+    return SignalDirection.LONG if quantity > 0 else SignalDirection.SHORT
+
+
+def _datetime_from_ms(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    try:
+        return datetime.fromtimestamp(int(value) / 1000, tz=UTC)
+    except (TypeError, ValueError):
+        return None
 
 
 def _float(value: Any) -> float:
