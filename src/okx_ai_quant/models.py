@@ -24,6 +24,20 @@ class OrderState(StrEnum):
     FAILED = "FAILED"
 
 
+class PositionState(StrEnum):
+    OPEN = "OPEN"
+    CLOSING = "CLOSING"
+    CLOSED = "CLOSED"
+
+
+class ExitReason(StrEnum):
+    STOP_LOSS = "STOP_LOSS"
+    TAKE_PROFIT = "TAKE_PROFIT"
+    REVERSE_SIGNAL = "REVERSE_SIGNAL"
+    TIMEOUT = "TIMEOUT"
+    RISK_EXIT = "RISK_EXIT"
+
+
 @dataclass(frozen=True, kw_only=True)
 class Candle:
     symbol: str
@@ -82,6 +96,41 @@ class OrderRecord:
     client_order_id: str | None = None
     order_type: str = "market"
     price: float | None = None
+    id: int | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class PositionRecord:
+    symbol: str
+    side: SignalDirection
+    quantity: float
+    average_entry: float
+    state: PositionState
+    opened_at: datetime
+    updated_at: datetime
+    entry_signal_id: int | None = None
+    stop_loss: float | None = None
+    take_profit: float | None = None
+    expires_at: datetime | None = None
+    exit_reason: ExitReason | None = None
+    closed_at: datetime | None = None
+    realized_pnl: float | None = None
+    id: int | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class PositionExitRecord:
+    position_id: int | None
+    symbol: str
+    side: SignalDirection
+    reason: ExitReason
+    entry_price: float
+    exit_price: float
+    quantity: float
+    realized_pnl: float
+    opened_at: datetime
+    closed_at: datetime
+    notes: str
     id: int | None = None
 
 

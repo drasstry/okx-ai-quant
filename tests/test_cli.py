@@ -199,6 +199,9 @@ def test_cli_menu_shows_runtime_summary_before_continuous_bot(monkeypatch, capsy
             "0.03",
             "120",
             "yes",
+            "24",
+            "no",
+            "yes",
         ]
     )
     captured = {}
@@ -227,6 +230,9 @@ def test_cli_menu_shows_runtime_summary_before_continuous_bot(monkeypatch, capsy
         "MAX_RISK_PER_TRADE": 0.005,
         "MAX_DAILY_LOSS": 0.03,
         "ORDER_STALE_SECONDS": 120,
+        "MANAGE_EXISTING_POSITIONS": True,
+        "POSITION_TIMEOUT_HOURS": 24,
+        "EXIT_ON_REVERSE_SIGNAL": False,
     }
 
 

@@ -102,7 +102,9 @@ class Settings(BaseSettings):
     APP_TIMEZONE: str = "Asia/Shanghai"
     REPORT_TIMES: str = "00:00,08:00,12:00,20:00"
     ORDER_STALE_SECONDS: int = Field(default=900, ge=30)
-    MANAGE_EXISTING_POSITIONS: bool = False
+    MANAGE_EXISTING_POSITIONS: bool = True
+    POSITION_TIMEOUT_HOURS: int = Field(default=72, ge=1)
+    EXIT_ON_REVERSE_SIGNAL: bool = True
     NOTIFIER: str = "console"
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_CHAT_ID: str = ""

@@ -33,6 +33,7 @@ def test_database_initializes_tables(tmp_path):
             "orders",
             "fills",
             "positions",
+            "position_exits",
             "balances",
             "trade_analyses",
             "daily_reports",

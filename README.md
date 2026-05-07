@@ -39,11 +39,12 @@ The core idea is simple:
 
 - Fetch OKX ticker and candle data
 - Normalize `1H` and `4H` candles
-- Run 4 built-in quant strategies
+- Run 6 built-in quant strategies
 - Estimate fee, slippage, and minimum expected move
 - Reject unsafe trades through a shared risk guard
 - Generate bilingual trade analysis with deterministic fallback or an OpenAI-compatible LLM
-- Store candles, signals, risk decisions, orders, fills, balances, reports, and analyses in SQLite
+- Store candles, signals, risk decisions, orders, fills, positions, exits, balances, reports, and analyses in SQLite
+- Manage bot-recorded positions with stop-loss, take-profit, reverse-signal, timeout, and risk exits
 - Run from CLI flags, an interactive wizard, or a menu-style control console
 - Push reports through console or Telegram notifications
 - Submit OKX demo orders when the account mode and API permissions allow it
@@ -152,6 +153,9 @@ POLL_INTERVAL_SECONDS=300
 APP_TIMEZONE=Asia/Shanghai
 REPORT_TIMES=00:00,08:00,12:00,20:00
 ORDER_STALE_SECONDS=900
+MANAGE_EXISTING_POSITIONS=true
+POSITION_TIMEOUT_HOURS=72
+EXIT_ON_REVERSE_SIGNAL=true
 NOTIFIER=console
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
@@ -212,6 +216,7 @@ When you choose `Start continuous bot`, the menu asks you to confirm or override
 - max risk per trade
 - max daily loss
 - stale-order cancellation time
+- position monitoring and exit settings
 
 The continuous bot uses `STRATEGY_NAME` from `.env` as the default strategy:
 
@@ -316,6 +321,9 @@ By default, `run-once` follows `ENABLE_TRADING`. If you want to submit an approv
 - skip new orders when a bot order is already pending
 - avoid repeating the same signal on the same candle
 - query tracked orders, record fills, update positions, and cancel stale bot orders
+- monitor bot-recorded open positions before opening new ones
+- submit reduce-only close orders for stop-loss, take-profit, reverse-signal, timeout, or risk exits
+- record closed-position PnL and exit attribution for review
 - send reports through the configured notifier
 
 ### Send a report now

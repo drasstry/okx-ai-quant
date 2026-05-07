@@ -367,6 +367,22 @@ def _prompt_continuous_bot_overrides(settings: Settings, *, language: str = "en"
         minimum=30,
         maximum=86_400,
     )
+    manage_positions = _confirm_localized(
+        "启用持仓监控和平仓" if language == "zh" else "Enable position monitoring and exits",
+        default=settings.MANAGE_EXISTING_POSITIONS,
+        language=language,
+    )
+    position_timeout_hours = _prompt_int(
+        "持仓超时小时数" if language == "zh" else "Position timeout hours",
+        default=settings.POSITION_TIMEOUT_HOURS,
+        minimum=1,
+        maximum=24 * 30,
+    )
+    exit_on_reverse_signal = _confirm_localized(
+        "反向信号触发平仓" if language == "zh" else "Exit on reverse signal",
+        default=settings.EXIT_ON_REVERSE_SIGNAL,
+        language=language,
+    )
 
     if mode == TradingMode.LIVE.value and enable_trading:
         print(
@@ -405,6 +421,9 @@ def _prompt_continuous_bot_overrides(settings: Settings, *, language: str = "en"
         "MAX_RISK_PER_TRADE": max_risk,
         "MAX_DAILY_LOSS": max_daily_loss,
         "ORDER_STALE_SECONDS": stale_seconds,
+        "MANAGE_EXISTING_POSITIONS": manage_positions,
+        "POSITION_TIMEOUT_HOURS": position_timeout_hours,
+        "EXIT_ON_REVERSE_SIGNAL": exit_on_reverse_signal,
     }
 
 
@@ -422,6 +441,9 @@ def _runtime_summary(settings: Settings, *, language: str = "en") -> str:
             f"  单笔最大风险: {settings.MAX_RISK_PER_TRADE:.2%}\n"
             f"  日内最大亏损: {settings.MAX_DAILY_LOSS:.2%}\n"
             f"  超时撤单: {settings.ORDER_STALE_SECONDS}s\n"
+            f"  持仓监控: {settings.MANAGE_EXISTING_POSITIONS}\n"
+            f"  持仓超时: {settings.POSITION_TIMEOUT_HOURS}h\n"
+            f"  反向信号平仓: {settings.EXIT_ON_REVERSE_SIGNAL}\n"
             f"  币种: {', '.join(settings.symbols)}\n"
             f"  通知: {settings.NOTIFIER}\n"
         )
@@ -438,6 +460,9 @@ def _runtime_summary(settings: Settings, *, language: str = "en") -> str:
         f"  max risk per trade: {settings.MAX_RISK_PER_TRADE:.2%}\n"
         f"  max daily loss: {settings.MAX_DAILY_LOSS:.2%}\n"
         f"  stale order cancel: {settings.ORDER_STALE_SECONDS}s\n"
+        f"  position monitoring: {settings.MANAGE_EXISTING_POSITIONS}\n"
+        f"  position timeout: {settings.POSITION_TIMEOUT_HOURS}h\n"
+        f"  exit on reverse signal: {settings.EXIT_ON_REVERSE_SIGNAL}\n"
         f"  symbols: {', '.join(settings.symbols)}\n"
         f"  notifier: {settings.NOTIFIER}\n"
     )

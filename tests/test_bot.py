@@ -4,11 +4,19 @@ from datetime import UTC, datetime
 from okx_ai_quant.bot import TradingBot
 from okx_ai_quant.config import Settings
 from okx_ai_quant.execution import ExecutionEngine
-from okx_ai_quant.models import Candle, RiskStatus, Signal, SignalDirection
+from okx_ai_quant.models import (
+    Candle,
+    ExitReason,
+    PositionState,
+    RiskStatus,
+    Signal,
+    SignalDirection,
+)
 from okx_ai_quant.notifier import NullNotifier
 from okx_ai_quant.risk import RiskDecision, RiskState
 from okx_ai_quant.runner import Runner
 from okx_ai_quant.storage import SQLiteStorage
+from okx_ai_quant.strategy import StrategySignal
 
 
 def _okx_row(minute: int, close: str = "101") -> list[str]:
@@ -24,6 +32,7 @@ class FakeClient:
         self.pending = {"data": []}
         self.order_response = {"data": []}
         self.instruments = {"data": [{"instId": "BTC-USDT-SWAP", "state": "live"}]}
+        self.ticker_last = "101"
 
     def sync_server_time(self) -> int:
         return 0
@@ -36,6 +45,16 @@ class FakeClient:
 
     def get_order(self, symbol, *, order_id=None, client_order_id=None):
         return self.order_response
+
+    def get_ticker(self, symbol):
+        return {
+            "instId": symbol,
+            "ts": str(int(datetime(2026, 5, 7, 8, 5, tzinfo=UTC).timestamp() * 1000)),
+            "bidPx": self.ticker_last,
+            "askPx": self.ticker_last,
+            "last": self.ticker_last,
+            "vol24h": "1000",
+        }
 
     def get_balance(self):
         return {
@@ -72,12 +91,15 @@ class FakeStrategy:
     direction: SignalDirection = SignalDirection.LONG
 
     def generate(self, symbol, one_hour: list[Candle], four_hour: list[Candle]) -> Signal:
-        return Signal(
+        return StrategySignal(
             symbol=symbol,
             timeframe="1H",
             direction=self.direction,
             confidence=0.8,
             reason="fixture",
+            entry_price=101.0,
+            stop_price=99.0 if self.direction == SignalDirection.LONG else 103.0,
+            target_price=105.0 if self.direction == SignalDirection.LONG else 97.0,
             created_at=datetime(2026, 5, 7, 8, 2, tzinfo=UTC),
         )
 
@@ -136,6 +158,73 @@ def test_bot_submit_mode_places_order_after_dry_run(tmp_path):
     assert results[0].submitted_order.order_id == "okx-order-1"
     assert client.trade_api.calls[0]["instId"] == "BTC-USDT-SWAP"
     assert bot.runner.storage.load_open_orders()[0].order_id == "okx-order-1"
+
+
+def test_bot_records_open_position_plan_after_entry_fill(tmp_path):
+    bot, client = _bot(tmp_path, enable_trading=True)
+    bot.run_once()
+    client.order_response = {
+        "data": [
+            {
+                "state": "filled",
+                "accFillSz": "0.5",
+                "avgPx": "101",
+                "fee": "-0.01",
+            }
+        ]
+    }
+
+    bot.sync_tracked_orders()
+
+    position = bot.runner.storage.load_position("BTC-USDT-SWAP")
+    assert position is not None
+    assert position.state == PositionState.OPEN
+    assert position.side == SignalDirection.LONG
+    assert position.quantity == 0.5
+    assert position.stop_loss == 99.0
+    assert position.take_profit == 105.0
+    assert position.expires_at is not None
+
+
+def test_bot_submits_close_order_and_records_exit_on_stop_loss(tmp_path):
+    bot, client = _bot(tmp_path, enable_trading=True)
+    bot.runner.storage.upsert_position(
+        symbol="BTC-USDT-SWAP",
+        side=SignalDirection.LONG,
+        quantity=0.5,
+        average_entry=110.0,
+        stop_loss=100.0,
+        take_profit=130.0,
+        opened_at=datetime(2026, 5, 7, 8, 0, tzinfo=UTC),
+        updated_at=datetime(2026, 5, 7, 8, 0, tzinfo=UTC),
+    )
+    client.ticker_last = "99"
+
+    close_orders = bot.monitor_positions()
+
+    assert close_orders[0].order_type == "market_close:STOP_LOSS"
+    assert client.trade_api.calls[0]["reduceOnly"] == "true"
+    assert client.trade_api.calls[0]["side"] == "sell"
+    assert bot.runner.storage.load_position("BTC-USDT-SWAP").state == PositionState.CLOSING
+
+    client.order_response = {
+        "data": [
+            {
+                "state": "filled",
+                "accFillSz": "0.5",
+                "avgPx": "98",
+                "fee": "-0.01",
+            }
+        ]
+    }
+    bot.sync_tracked_orders()
+
+    position = bot.runner.storage.load_position("BTC-USDT-SWAP")
+    exits = bot.runner.storage.load_position_exits("BTC-USDT-SWAP")
+    assert position.state == PositionState.CLOSED
+    assert position.realized_pnl == -6.0
+    assert exits[0].reason == ExitReason.STOP_LOSS
+    assert exits[0].realized_pnl == -6.0
 
 
 def test_bot_skips_duplicate_signal_for_same_candle(tmp_path):

@@ -44,7 +44,8 @@ OKX AI Quant 走中间路线：
 - 估算手续费、滑点和最小预期波动
 - 通过统一风控守卫拒绝不安全交易
 - 生成中英双语交易分析，支持本地确定性 fallback 或 OpenAI-compatible 大模型解读
-- 用 SQLite 记录 K 线、信号、风控决策、订单、成交、余额、报告和分析
+- 用 SQLite 记录 K 线、信号、风控决策、订单、成交、持仓、退出、余额、报告和分析
+- 管理本机器人记录的持仓，支持止损、止盈、反向信号、超时和风险退出
 - 支持 CLI 参数、交互式向导、菜单式控制台
 - 支持控制台或 Telegram 推送 AI 报告
 - 当 OKX 账户模式和 API 权限允许时，提交 OKX 模拟盘订单
@@ -153,6 +154,9 @@ POLL_INTERVAL_SECONDS=300
 APP_TIMEZONE=Asia/Shanghai
 REPORT_TIMES=00:00,08:00,12:00,20:00
 ORDER_STALE_SECONDS=900
+MANAGE_EXISTING_POSITIONS=true
+POSITION_TIMEOUT_HOURS=72
+EXIT_ON_REVERSE_SIGNAL=true
 NOTIFIER=console
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
@@ -213,6 +217,7 @@ uv run okx-ai-quant menu
 - 单笔最大风险
 - 日内最大亏损
 - 挂单超时取消时间
+- 持仓监控和平仓参数
 
 持续 bot 默认使用 `.env` 中的 `STRATEGY_NAME`：
 
@@ -326,6 +331,9 @@ uv run okx-ai-quant run-once \
 - 当已有 bot 挂单未完成时，跳过新开仓
 - 避免在同一根 K 线上重复执行同一信号
 - 查询已追踪订单、记录成交、更新持仓、取消过期 bot 挂单
+- 开新仓前先监控本机器人记录的开放持仓
+- 触发止损、止盈、反向信号、超时或风险退出时提交 reduce-only 平仓单
+- 记录已平仓 PnL 和退出归因，方便复盘
 - 通过配置的 notifier 推送报告
 
 ### 立即发送 AI 报告

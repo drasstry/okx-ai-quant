@@ -1,12 +1,22 @@
+import json
 import time
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from okx_ai_quant.account import AccountService
 from okx_ai_quant.config import Settings
 from okx_ai_quant.execution import ExecutionDecision
-from okx_ai_quant.models import FillRecord, OrderRecord, OrderState, RiskStatus, SignalDirection
+from okx_ai_quant.market_data import normalize_ticker
+from okx_ai_quant.models import (
+    ExitReason,
+    FillRecord,
+    OrderRecord,
+    OrderState,
+    PositionRecord,
+    RiskStatus,
+    SignalDirection,
+)
 from okx_ai_quant.notifier import NotificationError, Notifier
 from okx_ai_quant.reports import render_daily_report
 from okx_ai_quant.runner import RunOnceResult, Runner
@@ -52,6 +62,8 @@ class TradingBot:
         except Exception:
             pass
         self._snapshot_balances()
+        if self.settings.MANAGE_EXISTING_POSITIONS:
+            self.monitor_positions()
 
         results: list[BotCycleResult] = []
         for symbol in self._tradable_symbols():
@@ -201,11 +213,48 @@ class TradingBot:
             )
         )
         self.runner.storage.insert_order(submitted)
+        self._save_entry_plan(result, submitted)
         self._notify(
             f"Submitted order: {submitted.side} {submitted.symbol} "
             f"size={submitted.quantity:.6g}, ordId={submitted.order_id or '-'}."
         )
         return BotCycleResult(symbol=symbol, result=result, submitted_order=submitted)
+
+    def monitor_positions(self) -> list[OrderRecord]:
+        submitted_orders: list[OrderRecord] = []
+        for position in self.runner.storage.load_open_positions():
+            decision = self._position_exit_decision(position)
+            if decision is None:
+                continue
+            reason, exit_price, notes = decision
+            if not self.settings.ENABLE_TRADING:
+                self._notify(
+                    f"Planned exit only: {reason.value} {position.symbol} "
+                    f"at {exit_price:.6g}. Set ENABLE_TRADING=true to submit close orders."
+                )
+                continue
+
+            close_order = self.runner.execution_engine.close_position(
+                position,
+                reason=reason.value,
+            )
+            self.runner.storage.insert_order(close_order)
+            self.runner.storage.mark_position_closing(
+                symbol=position.symbol,
+                reason=reason,
+                updated_at=datetime.now(UTC),
+            )
+            submitted_orders.append(close_order)
+            self._notify(
+                f"Submitted close order: {reason.value} {position.symbol} "
+                f"qty={abs(position.quantity):.6g}, ordId={close_order.order_id or '-'}."
+            )
+            self.runner.storage.set_state(
+                f"last_exit_reason:{position.symbol}",
+                notes,
+                datetime.now(UTC),
+            )
+        return submitted_orders
 
     def _pending_order_reason(self, symbol: str) -> str | None:
         try:
@@ -275,15 +324,154 @@ class TradingBot:
             )
         )
 
+        if order.order_type.startswith("market_close"):
+            reason = _exit_reason_from_order_type(order.order_type)
+            exit_record = self.runner.storage.close_position(
+                symbol=order.symbol,
+                reason=reason,
+                exit_price=avg_price,
+                closed_at=datetime.now(UTC),
+                notes=f"Closed by {reason.value} from OKX fill {order.order_id}.",
+            )
+            if exit_record is not None:
+                self._notify(
+                    f"Position closed: {exit_record.reason.value} {exit_record.symbol} "
+                    f"PnL={exit_record.realized_pnl:.6g}."
+                )
+            return
+
         signed_quantity = fill_size if order.side == SignalDirection.LONG else -fill_size
         current = self.runner.storage.load_position_quantity(order.symbol)
         updated = current + signed_quantity
+        plan = self._load_entry_plan(order)
+        opened_at = _datetime_from_plan(plan.get("opened_at")) if plan else None
+        expires_at = _datetime_from_plan(plan.get("expires_at")) if plan else None
         self.runner.storage.upsert_position(
             symbol=order.symbol,
             quantity=updated,
             average_entry=avg_price,
+            side=order.side,
+            entry_signal_id=order.signal_id,
+            stop_loss=_float_or_none(plan.get("stop_loss")) if plan else None,
+            take_profit=_float_or_none(plan.get("take_profit")) if plan else None,
+            expires_at=expires_at,
+            opened_at=opened_at,
             updated_at=datetime.now(UTC),
         )
+
+    def _position_exit_decision(
+        self,
+        position: PositionRecord,
+    ) -> tuple[ExitReason, float, str] | None:
+        exit_price = self._latest_market_price(position.symbol)
+        if exit_price <= 0:
+            return None
+
+        if position.side == SignalDirection.LONG:
+            if position.stop_loss is not None and exit_price <= position.stop_loss:
+                return (
+                    ExitReason.STOP_LOSS,
+                    exit_price,
+                    f"Last price {exit_price:.6g} <= stop {position.stop_loss:.6g}.",
+                )
+            if position.take_profit is not None and exit_price >= position.take_profit:
+                return (
+                    ExitReason.TAKE_PROFIT,
+                    exit_price,
+                    f"Last price {exit_price:.6g} >= target {position.take_profit:.6g}.",
+                )
+        elif position.side == SignalDirection.SHORT:
+            if position.stop_loss is not None and exit_price >= position.stop_loss:
+                return (
+                    ExitReason.STOP_LOSS,
+                    exit_price,
+                    f"Last price {exit_price:.6g} >= stop {position.stop_loss:.6g}.",
+                )
+            if position.take_profit is not None and exit_price <= position.take_profit:
+                return (
+                    ExitReason.TAKE_PROFIT,
+                    exit_price,
+                    f"Last price {exit_price:.6g} <= target {position.take_profit:.6g}.",
+                )
+
+        now = datetime.now(UTC)
+        if position.expires_at is not None and now >= position.expires_at:
+            return (
+                ExitReason.TIMEOUT,
+                exit_price,
+                f"Position exceeded timeout at {position.expires_at.isoformat()}.",
+            )
+
+        risk_state = self.runner._resolve_risk_state()
+        if risk_state.daily_loss_rate >= self.settings.MAX_DAILY_LOSS:
+            return (
+                ExitReason.RISK_EXIT,
+                exit_price,
+                f"Daily loss {risk_state.daily_loss_rate:.4f} reached limit.",
+            )
+
+        if self.settings.EXIT_ON_REVERSE_SIGNAL:
+            reverse = self._reverse_signal_reason(position)
+            if reverse is not None:
+                return (ExitReason.REVERSE_SIGNAL, exit_price, reverse)
+
+        return None
+
+    def _latest_market_price(self, symbol: str) -> float:
+        try:
+            ticker = normalize_ticker(self.runner.client.get_ticker(symbol))
+            return ticker.last
+        except Exception:
+            candles = self.runner.storage.load_recent_candles(symbol, "1H", 1)
+            return candles[-1].close if candles else 0.0
+
+    def _reverse_signal_reason(self, position: PositionRecord) -> str | None:
+        try:
+            one_hour = self.runner._fetch_store_candles(position.symbol, "1H")
+            four_hour = self.runner._fetch_store_candles(position.symbol, "4H")
+            signal = self.runner.strategy.generate(position.symbol, one_hour, four_hour)
+        except Exception:
+            return None
+
+        if position.side == SignalDirection.LONG and signal.direction == SignalDirection.SHORT:
+            return f"Reverse signal detected: {signal.reason}"
+        if position.side == SignalDirection.SHORT and signal.direction == SignalDirection.LONG:
+            return f"Reverse signal detected: {signal.reason}"
+        return None
+
+    def _save_entry_plan(self, result: RunOnceResult, order: OrderRecord) -> None:
+        expires_at = datetime.now(UTC) + timedelta(hours=self.settings.POSITION_TIMEOUT_HOURS)
+        plan = {
+            "opened_at": datetime.now(UTC).isoformat(),
+            "expires_at": expires_at.isoformat(),
+            "entry_price": getattr(result.signal, "entry_price", None),
+            "stop_loss": getattr(result.signal, "stop_price", None),
+            "take_profit": getattr(result.signal, "target_price", None),
+        }
+        payload = json.dumps(plan, sort_keys=True)
+        for key in self._entry_plan_keys(order):
+            self.runner.storage.set_state(key, payload, datetime.now(UTC))
+
+    def _load_entry_plan(self, order: OrderRecord) -> dict[str, object]:
+        for key in self._entry_plan_keys(order):
+            raw = self.runner.storage.get_state(key)
+            if not raw:
+                continue
+            try:
+                decoded = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(decoded, dict):
+                return decoded
+        return {}
+
+    def _entry_plan_keys(self, order: OrderRecord) -> list[str]:
+        keys: list[str] = []
+        if order.client_order_id:
+            keys.append(f"entry_plan:client:{order.client_order_id}")
+        if order.order_id:
+            keys.append(f"entry_plan:order:{order.order_id}")
+        return keys
 
     def _daily_metrics(self, report_date: str) -> dict[str, object]:
         rows = self.runner.storage.connection.execute(
@@ -300,6 +488,11 @@ class TradingBot:
         if balance is not None:
             metrics["usdt_equity"] = f"{balance.equity:.2f}"
             metrics["usdt_available"] = f"{balance.available:.2f}"
+        exits = self.runner.storage.load_position_exits()
+        todays_exits = [exit for exit in exits if exit.closed_at.date().isoformat() == report_date]
+        if todays_exits:
+            metrics["closed_positions"] = len(todays_exits)
+            metrics["realized_pnl"] = f"{sum(exit.realized_pnl for exit in todays_exits):.6g}"
         return metrics
 
     def _sync_server_time(self) -> None:
@@ -344,3 +537,27 @@ def _int(value: object) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+def _float_or_none(value: object) -> float | None:
+    if value in (None, ""):
+        return None
+    parsed = _float(value)
+    return parsed if parsed > 0 else None
+
+
+def _datetime_from_plan(value: object) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value)).astimezone(UTC)
+    except ValueError:
+        return None
+
+
+def _exit_reason_from_order_type(order_type: str) -> ExitReason:
+    _, _, raw_reason = order_type.partition(":")
+    try:
+        return ExitReason(raw_reason)
+    except ValueError:
+        return ExitReason.RISK_EXIT

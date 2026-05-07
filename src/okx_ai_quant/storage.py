@@ -8,6 +8,10 @@ from okx_ai_quant.models import (
     FillRecord,
     OrderRecord,
     OrderState,
+    ExitReason,
+    PositionExitRecord,
+    PositionRecord,
+    PositionState,
     Signal,
     SignalDirection,
     TradeAnalysis,
@@ -120,9 +124,35 @@ class SQLiteStorage:
             CREATE TABLE IF NOT EXISTS positions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 symbol TEXT NOT NULL UNIQUE,
+                side TEXT NOT NULL DEFAULT 'LONG',
                 quantity REAL NOT NULL,
                 average_entry REAL NOT NULL,
-                updated_at TEXT NOT NULL
+                state TEXT NOT NULL DEFAULT 'OPEN',
+                opened_at TEXT,
+                updated_at TEXT NOT NULL,
+                entry_signal_id INTEGER,
+                stop_loss REAL,
+                take_profit REAL,
+                expires_at TEXT,
+                exit_reason TEXT,
+                closed_at TEXT,
+                realized_pnl REAL
+            );
+
+            CREATE TABLE IF NOT EXISTS position_exits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                position_id INTEGER,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                entry_price REAL NOT NULL,
+                exit_price REAL NOT NULL,
+                quantity REAL NOT NULL,
+                realized_pnl REAL NOT NULL,
+                opened_at TEXT NOT NULL,
+                closed_at TEXT NOT NULL,
+                notes TEXT NOT NULL,
+                FOREIGN KEY (position_id) REFERENCES positions(id)
             );
 
             CREATE TABLE IF NOT EXISTS balances (
@@ -182,6 +212,24 @@ class SQLiteStorage:
             )
         if "price" not in order_columns:
             self.connection.execute("ALTER TABLE orders ADD COLUMN price REAL")
+
+        position_columns = {
+            row["name"] for row in self.connection.execute("PRAGMA table_info(positions)").fetchall()
+        }
+        for column, definition in (
+            ("side", "TEXT NOT NULL DEFAULT 'LONG'"),
+            ("state", "TEXT NOT NULL DEFAULT 'OPEN'"),
+            ("opened_at", "TEXT"),
+            ("entry_signal_id", "INTEGER"),
+            ("stop_loss", "REAL"),
+            ("take_profit", "REAL"),
+            ("expires_at", "TEXT"),
+            ("exit_reason", "TEXT"),
+            ("closed_at", "TEXT"),
+            ("realized_pnl", "REAL"),
+        ):
+            if column not in position_columns:
+                self.connection.execute(f"ALTER TABLE positions ADD COLUMN {column} {definition}")
         self.connection.commit()
 
     def upsert_candle(
@@ -410,17 +458,55 @@ class SQLiteStorage:
         quantity: float,
         average_entry: float,
         updated_at: datetime,
+        side: SignalDirection | None = None,
+        state: PositionState = PositionState.OPEN,
+        opened_at: datetime | None = None,
+        entry_signal_id: int | None = None,
+        stop_loss: float | None = None,
+        take_profit: float | None = None,
+        expires_at: datetime | None = None,
     ) -> int:
+        side = side or (SignalDirection.SHORT if quantity < 0 else SignalDirection.LONG)
+        opened_at = opened_at or updated_at
         self.connection.execute(
             """
-            INSERT INTO positions (symbol, quantity, average_entry, updated_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO positions (
+                symbol, side, quantity, average_entry, state, opened_at, updated_at,
+                entry_signal_id, stop_loss, take_profit, expires_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(symbol) DO UPDATE SET
+                side = excluded.side,
                 quantity = excluded.quantity,
                 average_entry = excluded.average_entry,
-                updated_at = excluded.updated_at
+                state = excluded.state,
+                opened_at = CASE
+                    WHEN positions.state = 'CLOSED' OR positions.quantity = 0
+                    THEN excluded.opened_at
+                    ELSE COALESCE(positions.opened_at, excluded.opened_at)
+                END,
+                updated_at = excluded.updated_at,
+                entry_signal_id = COALESCE(excluded.entry_signal_id, positions.entry_signal_id),
+                stop_loss = COALESCE(excluded.stop_loss, positions.stop_loss),
+                take_profit = COALESCE(excluded.take_profit, positions.take_profit),
+                expires_at = COALESCE(excluded.expires_at, positions.expires_at),
+                exit_reason = NULL,
+                closed_at = NULL,
+                realized_pnl = NULL
             """,
-            (symbol, quantity, average_entry, _to_utc_text(updated_at)),
+            (
+                symbol,
+                side.value,
+                quantity,
+                average_entry,
+                state.value,
+                _to_utc_text(opened_at),
+                _to_utc_text(updated_at),
+                entry_signal_id,
+                stop_loss,
+                take_profit,
+                _to_utc_text(expires_at) if expires_at is not None else None,
+            ),
         )
         row = self.connection.execute(
             "SELECT id FROM positions WHERE symbol = ?",
@@ -428,6 +514,145 @@ class SQLiteStorage:
         ).fetchone()
         self.connection.commit()
         return int(row["id"])
+
+    def load_position(self, symbol: str) -> PositionRecord | None:
+        row = self.connection.execute(
+            "SELECT * FROM positions WHERE symbol = ?",
+            (symbol,),
+        ).fetchone()
+        return self._position_from_row(row) if row is not None else None
+
+    def load_open_positions(self) -> list[PositionRecord]:
+        rows = self.connection.execute(
+            """
+            SELECT * FROM positions
+            WHERE state = 'OPEN' AND ABS(quantity) > 0
+            ORDER BY updated_at ASC
+            """
+        ).fetchall()
+        return [self._position_from_row(row) for row in rows]
+
+    def mark_position_closing(
+        self,
+        *,
+        symbol: str,
+        reason: ExitReason,
+        updated_at: datetime,
+    ) -> int:
+        cursor = self.connection.execute(
+            """
+            UPDATE positions
+            SET state = ?, exit_reason = ?, updated_at = ?
+            WHERE symbol = ? AND state = 'OPEN'
+            """,
+            (PositionState.CLOSING.value, reason.value, _to_utc_text(updated_at), symbol),
+        )
+        self.connection.commit()
+        return int(cursor.rowcount)
+
+    def close_position(
+        self,
+        *,
+        symbol: str,
+        reason: ExitReason,
+        exit_price: float,
+        closed_at: datetime,
+        notes: str,
+    ) -> PositionExitRecord | None:
+        position = self.load_position(symbol)
+        if position is None or position.quantity == 0:
+            return None
+
+        realized_pnl = (exit_price - position.average_entry) * position.quantity
+        abs_quantity = abs(position.quantity)
+        self.connection.execute(
+            """
+            UPDATE positions
+            SET quantity = 0,
+                state = ?,
+                exit_reason = ?,
+                closed_at = ?,
+                realized_pnl = ?,
+                updated_at = ?
+            WHERE symbol = ?
+            """,
+            (
+                PositionState.CLOSED.value,
+                reason.value,
+                _to_utc_text(closed_at),
+                realized_pnl,
+                _to_utc_text(closed_at),
+                symbol,
+            ),
+        )
+        exit_record = PositionExitRecord(
+            position_id=position.id,
+            symbol=position.symbol,
+            side=position.side,
+            reason=reason,
+            entry_price=position.average_entry,
+            exit_price=exit_price,
+            quantity=abs_quantity,
+            realized_pnl=realized_pnl,
+            opened_at=position.opened_at,
+            closed_at=closed_at,
+            notes=notes,
+        )
+        exit_id = self.insert_position_exit(exit_record, commit=False)
+        self.connection.commit()
+        return PositionExitRecord(
+            id=exit_id,
+            position_id=exit_record.position_id,
+            symbol=exit_record.symbol,
+            side=exit_record.side,
+            reason=exit_record.reason,
+            entry_price=exit_record.entry_price,
+            exit_price=exit_record.exit_price,
+            quantity=exit_record.quantity,
+            realized_pnl=exit_record.realized_pnl,
+            opened_at=exit_record.opened_at,
+            closed_at=exit_record.closed_at,
+            notes=exit_record.notes,
+        )
+
+    def insert_position_exit(self, exit_record: PositionExitRecord, *, commit: bool = True) -> int:
+        cursor = self.connection.execute(
+            """
+            INSERT INTO position_exits (
+                position_id, symbol, side, reason, entry_price, exit_price, quantity,
+                realized_pnl, opened_at, closed_at, notes
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                exit_record.position_id,
+                exit_record.symbol,
+                exit_record.side.value,
+                exit_record.reason.value,
+                exit_record.entry_price,
+                exit_record.exit_price,
+                exit_record.quantity,
+                exit_record.realized_pnl,
+                _to_utc_text(exit_record.opened_at),
+                _to_utc_text(exit_record.closed_at),
+                exit_record.notes,
+            ),
+        )
+        if commit:
+            self.connection.commit()
+        return int(cursor.lastrowid)
+
+    def load_position_exits(self, symbol: str | None = None) -> list[PositionExitRecord]:
+        if symbol:
+            rows = self.connection.execute(
+                "SELECT * FROM position_exits WHERE symbol = ? ORDER BY closed_at ASC",
+                (symbol,),
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                "SELECT * FROM position_exits ORDER BY closed_at ASC"
+            ).fetchall()
+        return [self._position_exit_from_row(row) for row in rows]
 
     def load_position_quantity(self, symbol: str) -> float:
         row = self.connection.execute(
@@ -598,4 +823,40 @@ class SQLiteStorage:
             price=row["price"],
             state=OrderState(row["state"]),
             created_at=_from_utc_text(row["created_at"]),
+        )
+
+    def _position_from_row(self, row: sqlite3.Row) -> PositionRecord:
+        opened_at = row["opened_at"] or row["updated_at"]
+        return PositionRecord(
+            id=row["id"],
+            symbol=row["symbol"],
+            side=SignalDirection(row["side"]),
+            quantity=row["quantity"],
+            average_entry=row["average_entry"],
+            state=PositionState(row["state"]),
+            opened_at=_from_utc_text(opened_at),
+            updated_at=_from_utc_text(row["updated_at"]),
+            entry_signal_id=row["entry_signal_id"],
+            stop_loss=row["stop_loss"],
+            take_profit=row["take_profit"],
+            expires_at=_from_utc_text(row["expires_at"]) if row["expires_at"] else None,
+            exit_reason=ExitReason(row["exit_reason"]) if row["exit_reason"] else None,
+            closed_at=_from_utc_text(row["closed_at"]) if row["closed_at"] else None,
+            realized_pnl=row["realized_pnl"],
+        )
+
+    def _position_exit_from_row(self, row: sqlite3.Row) -> PositionExitRecord:
+        return PositionExitRecord(
+            id=row["id"],
+            position_id=row["position_id"],
+            symbol=row["symbol"],
+            side=SignalDirection(row["side"]),
+            reason=ExitReason(row["reason"]),
+            entry_price=row["entry_price"],
+            exit_price=row["exit_price"],
+            quantity=row["quantity"],
+            realized_pnl=row["realized_pnl"],
+            opened_at=_from_utc_text(row["opened_at"]),
+            closed_at=_from_utc_text(row["closed_at"]),
+            notes=row["notes"],
         )

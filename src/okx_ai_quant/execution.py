@@ -4,7 +4,7 @@ from math import isfinite
 from typing import Callable, Protocol
 from uuid import uuid4
 
-from okx_ai_quant.models import OrderRecord, OrderState, RiskStatus, SignalDirection
+from okx_ai_quant.models import OrderRecord, OrderState, PositionRecord, RiskStatus, SignalDirection
 
 
 class ExecutableRiskDecision(Protocol):
@@ -75,6 +75,52 @@ class ExecutionEngine:
             side=decision.direction,
             quantity=float(decision.position_size_usdt),
             state=OrderState.SUBMITTED,
+            created_at=datetime.now(UTC),
+        )
+
+    def close_position(self, position: PositionRecord, *, reason: str) -> OrderRecord:
+        is_live = _is_live_client(self.client)
+        if is_live and not _live_execution_allowed(self.client):
+            raise RuntimeError("Live execution requires ALLOW_LIVE_TRADING=true")
+
+        if position.side == SignalDirection.LONG:
+            side = "sell"
+            close_direction = SignalDirection.SHORT
+        elif position.side == SignalDirection.SHORT:
+            side = "buy"
+            close_direction = SignalDirection.LONG
+        else:
+            raise ValueError("Only LONG/SHORT positions can be closed")
+
+        quantity = abs(position.quantity)
+        if not isfinite(quantity) or quantity <= 0:
+            raise ValueError("position quantity must be positive")
+
+        client_order_id = f"okxaiclose{uuid4().hex[:15]}"
+        response = self.client.trade_api.place_order(
+            instId=position.symbol,
+            tdMode="isolated",
+            side=side,
+            ordType="market",
+            sz=str(quantity),
+            reduceOnly="true",
+            clOrdId=client_order_id,
+        )
+        self.client._raise_for_error(response)
+        order_id = None
+        data = response.get("data")
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            order_id = data[0].get("ordId")
+
+        return OrderRecord(
+            signal_id=position.entry_signal_id,
+            order_id=order_id,
+            client_order_id=client_order_id,
+            symbol=position.symbol,
+            side=close_direction,
+            quantity=quantity,
+            state=OrderState.SUBMITTED,
+            order_type=f"market_close:{reason}",
             created_at=datetime.now(UTC),
         )
 
