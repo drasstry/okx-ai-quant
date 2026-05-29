@@ -1,4 +1,5 @@
 import json
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -29,9 +30,10 @@ class NullNotifier(Notifier):
 
 
 class TelegramNotifier(Notifier):
-    def __init__(self, *, bot_token: str, chat_id: str) -> None:
+    def __init__(self, *, bot_token: str, chat_id: str, proxy_url: str = "") -> None:
         self.bot_token = bot_token
         self.chat_id = chat_id
+        self.proxy_url = proxy_url.strip()
 
     def send(self, message: str) -> None:
         if not self.bot_token or not self.chat_id:
@@ -52,10 +54,12 @@ class TelegramNotifier(Notifier):
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=20) as response:
+            with _open_telegram_request(request, timeout=20, proxy_url=self.proxy_url) as response:
                 raw = json.loads(response.read().decode("utf-8"))
-        except (urllib.error.HTTPError, urllib.error.URLError) as exc:
+        except (TimeoutError, socket.timeout, OSError, urllib.error.HTTPError, urllib.error.URLError) as exc:
             raise NotificationError(f"Telegram send failed: {exc}") from exc
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise NotificationError(f"Telegram send returned invalid JSON: {exc}") from exc
 
         if not raw.get("ok"):
             raise NotificationError(f"Telegram send failed: {raw}")
@@ -69,9 +73,10 @@ class TelegramUpdate:
 
 
 class TelegramBotClient:
-    def __init__(self, *, bot_token: str, chat_id: str) -> None:
+    def __init__(self, *, bot_token: str, chat_id: str, proxy_url: str = "") -> None:
         self.bot_token = bot_token
         self.chat_id = chat_id
+        self.proxy_url = proxy_url.strip()
 
     def get_updates(self, *, offset: int | None = None, timeout: int = 25) -> list[TelegramUpdate]:
         if not self.bot_token or not self.chat_id:
@@ -83,10 +88,16 @@ class TelegramBotClient:
         url = f"https://api.telegram.org/bot{self.bot_token}/getUpdates?{urllib.parse.urlencode(params)}"
         request = urllib.request.Request(url, method="GET")
         try:
-            with urllib.request.urlopen(request, timeout=timeout + 5) as response:
+            with _open_telegram_request(
+                request,
+                timeout=timeout + 5,
+                proxy_url=self.proxy_url,
+            ) as response:
                 raw = json.loads(response.read().decode("utf-8"))
-        except (urllib.error.HTTPError, urllib.error.URLError) as exc:
+        except (TimeoutError, socket.timeout, OSError, urllib.error.HTTPError, urllib.error.URLError) as exc:
             raise NotificationError(f"Telegram polling failed: {exc}") from exc
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise NotificationError(f"Telegram polling returned invalid JSON: {exc}") from exc
 
         if not raw.get("ok"):
             raise NotificationError(f"Telegram polling failed: {raw}")
@@ -104,7 +115,11 @@ class TelegramBotClient:
         return updates
 
     def send(self, message: str) -> None:
-        TelegramNotifier(bot_token=self.bot_token, chat_id=self.chat_id).send(message)
+        TelegramNotifier(
+            bot_token=self.bot_token,
+            chat_id=self.chat_id,
+            proxy_url=self.proxy_url,
+        ).send(message)
 
 
 def build_notifier(settings: Settings) -> Notifier:
@@ -113,7 +128,16 @@ def build_notifier(settings: Settings) -> Notifier:
         return TelegramNotifier(
             bot_token=settings.TELEGRAM_BOT_TOKEN,
             chat_id=settings.TELEGRAM_CHAT_ID,
+            proxy_url=settings.TELEGRAM_PROXY_URL,
         )
     if name == "none":
         return NullNotifier()
     return ConsoleNotifier()
+
+
+def _open_telegram_request(request: urllib.request.Request, *, timeout: int, proxy_url: str):
+    if not proxy_url:
+        return urllib.request.urlopen(request, timeout=timeout)
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+    ).open(request, timeout=timeout)

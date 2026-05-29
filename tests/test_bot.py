@@ -7,6 +7,8 @@ from okx_ai_quant.execution import ExecutionEngine
 from okx_ai_quant.models import (
     Candle,
     ExitReason,
+    OrderRecord,
+    OrderState,
     PositionState,
     RiskStatus,
     Signal,
@@ -31,12 +33,35 @@ class FakeClient:
         self.settings = None
         self.pending = {"data": []}
         self.order_response = {"data": []}
-        self.instruments = {"data": [{"instId": "BTC-USDT-SWAP", "state": "live"}]}
+        self.instruments = {
+            "data": [
+                {
+                    "instId": "BTC-USDT-SWAP",
+                    "state": "live",
+                    "instType": "SWAP",
+                    "ctType": "linear",
+                    "ctVal": "0.01",
+                    "ctValCcy": "BTC",
+                    "lotSz": "0.01",
+                    "minSz": "0.01",
+                }
+            ]
+        }
         self.ticker_last = "101"
         self.positions_response = {"data": []}
+        self.leverage_calls = []
+        self.connectivity_ok = True
+        self.connectivity_detail = "OKX connectivity healthy (5/5)"
+        self.connectivity_checks = []
 
     def sync_server_time(self) -> int:
         return 0
+
+    def check_connectivity(self, *, attempts=5, required_successes=5, symbol="BTC-USDT-SWAP"):
+        self.connectivity_checks.append(
+            {"attempts": attempts, "required_successes": required_successes, "symbol": symbol}
+        )
+        return self.connectivity_ok, self.connectivity_detail
 
     def get_candles(self, symbol, bar, limit):
         return [_okx_row(0), _okx_row(1)]
@@ -73,6 +98,19 @@ class FakeClient:
     def get_instruments(self, inst_type):
         return self.instruments["data"]
 
+    def set_leverage(self, symbol, *, leverage, margin_mode, position_side=None):
+        self.leverage_calls.append(
+            {
+                "symbol": symbol,
+                "leverage": leverage,
+                "margin_mode": margin_mode,
+                "position_side": position_side,
+            }
+        )
+        response = {"code": "0", "data": [{"instId": symbol, "lever": str(leverage)}]}
+        self._raise_for_error(response)
+        return response
+
     def cancel_order(self, symbol, *, order_id=None, client_order_id=None):
         return {"code": "0", "data": [{"ordId": order_id, "clOrdId": client_order_id}]}
 
@@ -84,9 +122,12 @@ class FakeClient:
 class FakeTradeApi:
     def __init__(self) -> None:
         self.calls = []
+        self.failures = []
 
     def place_order(self, **kwargs):
         self.calls.append(kwargs)
+        if self.failures:
+            raise self.failures.pop(0)
         return {"code": "0", "data": [{"ordId": "okx-order-1"}]}
 
 
@@ -136,12 +177,36 @@ def _bot(tmp_path, *, enable_trading: bool) -> tuple[TradingBot, FakeClient]:
         storage=storage,
         strategy=FakeStrategy(),
         risk_guard=FakeRiskGuard(),
-        execution_engine=ExecutionEngine(client),
+        execution_engine=ExecutionEngine(client, retry_delay_seconds=0),
         risk_state=RiskState(),
         candle_limit=2,
         enable_trading=False,
     )
     return TradingBot(settings=settings, runner=runner, notifier=NullNotifier()), client
+
+
+def _set_exchange_position(
+    client: FakeClient,
+    *,
+    symbol: str = "BTC-USDT-SWAP",
+    pos: str = "0.5",
+    pos_side: str = "long",
+    avg_px: str = "110",
+    margin_mode: str = "isolated",
+    lever: str = "1",
+) -> None:
+    client.positions_response = {
+        "data": [
+            {
+                "instId": symbol,
+                "mgnMode": margin_mode,
+                "lever": lever,
+                "posSide": pos_side,
+                "pos": pos,
+                "avgPx": avg_px,
+            }
+        ]
+    }
 
 
 def test_bot_observe_mode_plans_without_submitting(tmp_path):
@@ -162,6 +227,47 @@ def test_bot_submit_mode_places_order_after_dry_run(tmp_path):
     assert results[0].submitted_order.order_id == "okx-order-1"
     assert client.trade_api.calls[0]["instId"] == "BTC-USDT-SWAP"
     assert bot.runner.storage.load_open_orders()[0].order_id == "okx-order-1"
+    assert client.connectivity_checks == [
+        {"attempts": 5, "required_successes": 5, "symbol": "BTC-USDT-SWAP"}
+    ]
+
+
+def test_bot_blocks_new_entries_when_okx_connectivity_is_unhealthy(tmp_path):
+    bot, client = _bot(tmp_path, enable_trading=True)
+    client.connectivity_ok = False
+    client.connectivity_detail = "OKX connectivity unhealthy (1/3): SSL timeout"
+
+    results = bot.run_once()
+
+    assert results[0].submitted_order is None
+    assert "connectivity unhealthy" in results[0].skipped_reason
+    assert client.trade_api.calls == []
+    assert bot.runner.storage.load_open_orders() == []
+
+
+def test_bot_still_allows_close_orders_when_entry_connectivity_check_fails(tmp_path):
+    bot, client = _bot(tmp_path, enable_trading=True)
+    client.connectivity_ok = False
+    client.connectivity_detail = "OKX connectivity unhealthy (0/3): SSL timeout"
+    bot.runner.storage.upsert_position(
+        symbol="BTC-USDT-SWAP",
+        side=SignalDirection.LONG,
+        quantity=0.5,
+        average_entry=110.0,
+        stop_loss=100.0,
+        take_profit=130.0,
+        opened_at=datetime(2026, 5, 7, 8, 0, tzinfo=UTC),
+        updated_at=datetime(2026, 5, 7, 8, 0, tzinfo=UTC),
+    )
+    _set_exchange_position(client)
+    client.ticker_last = "99"
+
+    results = bot.run_once()
+
+    assert results[0].submitted_order is None
+    assert "connectivity unhealthy" in results[0].skipped_reason
+    assert client.trade_api.calls[0]["reduceOnly"] == "true"
+    assert bot.runner.storage.load_open_orders()[0].order_type == "market_close:STOP_LOSS"
 
 
 def test_bot_publishes_runtime_status_for_telegram_status(tmp_path):
@@ -254,6 +360,69 @@ def test_bot_marks_local_position_closed_when_missing_on_exchange(tmp_path):
     assert exits[0].reason == ExitReason.RISK_EXIT
 
 
+def test_bot_still_submits_close_order_when_new_trade_loss_limit_is_reached(tmp_path):
+    bot, client = _bot(tmp_path, enable_trading=True)
+    for index in range(3):
+        bot.runner.storage.insert_order(
+            OrderRecord(
+                signal_id=None,
+                order_id=f"canceled-{index}",
+                client_order_id=f"okxai-canceled-{index}",
+                symbol="BTC-USDT-SWAP",
+                side=SignalDirection.LONG,
+                quantity=1.0,
+                state=OrderState.CANCELED,
+                created_at=datetime(2026, 5, 7, 7, index, tzinfo=UTC),
+            )
+        )
+    assert bot.runner.storage.load_risk_state().consecutive_losses == 3
+    bot.runner.storage.upsert_position(
+        symbol="BTC-USDT-SWAP",
+        side=SignalDirection.LONG,
+        quantity=0.5,
+        average_entry=110.0,
+        stop_loss=100.0,
+        take_profit=130.0,
+        opened_at=datetime(2026, 5, 7, 8, 0, tzinfo=UTC),
+        updated_at=datetime(2026, 5, 7, 8, 0, tzinfo=UTC),
+    )
+    _set_exchange_position(client)
+    client.ticker_last = "99"
+
+    close_orders = bot.monitor_positions()
+
+    assert close_orders[0].order_type == "market_close:STOP_LOSS"
+    assert client.trade_api.calls[0]["reduceOnly"] == "true"
+    assert client.trade_api.calls[0]["side"] == "sell"
+
+
+def test_bot_close_order_failure_is_logged_without_crashing_or_marking_closing(tmp_path):
+    bot, client = _bot(tmp_path, enable_trading=True)
+    client.trade_api.failures = [
+        TimeoutError("read timed out"),
+        TimeoutError("read timed out"),
+        TimeoutError("read timed out"),
+    ]
+    bot.runner.storage.upsert_position(
+        symbol="BTC-USDT-SWAP",
+        side=SignalDirection.LONG,
+        quantity=0.5,
+        average_entry=110.0,
+        stop_loss=100.0,
+        take_profit=130.0,
+        opened_at=datetime(2026, 5, 7, 8, 0, tzinfo=UTC),
+        updated_at=datetime(2026, 5, 7, 8, 0, tzinfo=UTC),
+    )
+    _set_exchange_position(client)
+    client.ticker_last = "99"
+
+    close_orders = bot.monitor_positions()
+
+    assert close_orders == []
+    assert len(client.trade_api.calls) == 3
+    assert bot.runner.storage.load_position("BTC-USDT-SWAP").state == PositionState.OPEN
+
+
 def test_bot_submits_close_order_and_records_exit_on_stop_loss(tmp_path):
     bot, client = _bot(tmp_path, enable_trading=True)
     bot.runner.storage.upsert_position(
@@ -266,6 +435,7 @@ def test_bot_submits_close_order_and_records_exit_on_stop_loss(tmp_path):
         opened_at=datetime(2026, 5, 7, 8, 0, tzinfo=UTC),
         updated_at=datetime(2026, 5, 7, 8, 0, tzinfo=UTC),
     )
+    _set_exchange_position(client)
     client.ticker_last = "99"
 
     close_orders = bot.monitor_positions()
@@ -285,14 +455,105 @@ def test_bot_submits_close_order_and_records_exit_on_stop_loss(tmp_path):
             }
         ]
     }
+    client.positions_response = {"data": []}
     bot.sync_tracked_orders()
 
     position = bot.runner.storage.load_position("BTC-USDT-SWAP")
     exits = bot.runner.storage.load_position_exits("BTC-USDT-SWAP")
     assert position.state == PositionState.CLOSED
-    assert position.realized_pnl == -6.0
+    assert position.realized_pnl == -0.06
     assert exits[0].reason == ExitReason.STOP_LOSS
-    assert exits[0].realized_pnl == -6.0
+    assert exits[0].realized_pnl == -0.06
+
+
+def test_bot_does_not_submit_duplicate_close_order_when_one_is_pending(tmp_path):
+    bot, client = _bot(tmp_path, enable_trading=True)
+    bot.runner.storage.upsert_position(
+        symbol="BTC-USDT-SWAP",
+        side=SignalDirection.LONG,
+        quantity=0.5,
+        average_entry=110.0,
+        stop_loss=100.0,
+        take_profit=130.0,
+        opened_at=datetime(2026, 5, 7, 8, 0, tzinfo=UTC),
+        updated_at=datetime(2026, 5, 7, 8, 0, tzinfo=UTC),
+    )
+    _set_exchange_position(client)
+    bot.runner.storage.insert_order(
+        OrderRecord(
+            symbol="BTC-USDT-SWAP",
+            side=SignalDirection.SHORT,
+            quantity=0.5,
+            state=OrderState.SUBMITTED,
+            created_at=datetime(2026, 5, 7, 8, 1, tzinfo=UTC),
+            order_id="existing-close",
+            client_order_id="okxaicloseexisting",
+            order_type="market_close:STOP_LOSS",
+        )
+    )
+    client.ticker_last = "99"
+
+    close_orders = bot.monitor_positions()
+
+    assert close_orders == []
+    assert client.trade_api.calls == []
+    assert bot.runner.storage.load_position("BTC-USDT-SWAP").state == PositionState.CLOSING
+
+
+def test_bot_keeps_position_open_when_close_fill_does_not_flatten_okx_position(tmp_path):
+    bot, client = _bot(tmp_path, enable_trading=True)
+    bot.runner.storage.upsert_position(
+        symbol="BTC-USDT-SWAP",
+        side=SignalDirection.SHORT,
+        quantity=-10.0,
+        average_entry=110.0,
+        margin_mode="isolated",
+        leverage=3,
+        opened_at=datetime(2026, 5, 7, 8, 0, tzinfo=UTC),
+        updated_at=datetime(2026, 5, 7, 8, 0, tzinfo=UTC),
+    )
+    bot.runner.storage.insert_order(
+        OrderRecord(
+            symbol="BTC-USDT-SWAP",
+            side=SignalDirection.LONG,
+            quantity=10.0,
+            state=OrderState.SUBMITTED,
+            created_at=datetime(2026, 5, 7, 8, 1, tzinfo=UTC),
+            order_id="close-cross-only",
+            client_order_id="okxaicloseexisting",
+            order_type="market_close:TAKE_PROFIT",
+        )
+    )
+    client.order_response = {
+        "data": [
+            {
+                "state": "filled",
+                "accFillSz": "10",
+                "avgPx": "100",
+                "fee": "-0.01",
+            }
+        ]
+    }
+    client.positions_response = {
+        "data": [
+            {
+                "instId": "BTC-USDT-SWAP",
+                "mgnMode": "isolated",
+                "lever": "3",
+                "posSide": "net",
+                "pos": "-10",
+                "avgPx": "110",
+            }
+        ]
+    }
+
+    bot.sync_tracked_orders()
+
+    position = bot.runner.storage.load_position("BTC-USDT-SWAP")
+    assert position.state == PositionState.OPEN
+    assert position.quantity == -10.0
+    assert position.margin_mode == "isolated"
+    assert bot.runner.storage.load_position_exits("BTC-USDT-SWAP") == []
 
 
 def test_bot_skips_duplicate_signal_for_same_candle(tmp_path):
@@ -323,7 +584,7 @@ def test_bot_filters_symbols_not_available_in_okx_environment(tmp_path):
         storage=storage,
         strategy=FakeStrategy(),
         risk_guard=FakeRiskGuard(),
-        execution_engine=ExecutionEngine(client),
+        execution_engine=ExecutionEngine(client, retry_delay_seconds=0),
         risk_state=RiskState(),
         candle_limit=2,
         enable_trading=False,
@@ -333,6 +594,33 @@ def test_bot_filters_symbols_not_available_in_okx_environment(tmp_path):
     results = bot.run_once()
 
     assert [result.symbol for result in results] == ["BTC-USDT-SWAP"]
+
+
+def test_telegram_notifier_suppresses_operational_noise_but_sends_reports(tmp_path):
+    class FakeNotifier:
+        def __init__(self):
+            self.messages = []
+
+        def send(self, message):
+            self.messages.append(message)
+
+    bot, _client = _bot(tmp_path, enable_trading=False)
+    bot.settings = Settings(
+        _env_file=None,
+        ENABLE_TRADING=False,
+        NOTIFIER="telegram",
+        SYMBOLS="BTC-USDT-SWAP",
+        DB_PATH=tmp_path / "bot.sqlite3",
+    )
+    fake_notifier = FakeNotifier()
+    bot.notifier = fake_notifier
+
+    bot._notify("Submitted order: noisy detail")
+    assert fake_notifier.messages == []
+
+    assert bot.send_daily_report(date(2026, 5, 7), force=True)
+    assert len(fake_notifier.messages) == 1
+    assert "OKX 交易概览" in fake_notifier.messages[0]
 
 
 def test_due_report_slots_include_missed_times_without_future_times():

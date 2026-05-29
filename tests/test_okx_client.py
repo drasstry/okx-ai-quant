@@ -12,15 +12,21 @@ from okx_ai_quant.okx_client import OkxClient
 class FakeMarketApi:
     def __init__(self):
         self.calls = []
+        self.failures = []
         self.candles_response = {"code": "0", "data": [["newer"], ["older"]]}
         self.ticker_response = {"code": "0", "data": [{"instId": "BTC-USDT-SWAP"}]}
+        self.ticker_responses = []
 
     def get_candlesticks(self, **kwargs):
         self.calls.append(("get_candlesticks", kwargs))
+        if self.failures:
+            return self.failures.pop(0)
         return self.candles_response
 
     def get_ticker(self, **kwargs):
         self.calls.append(("get_ticker", kwargs))
+        if self.ticker_responses:
+            return self.ticker_responses.pop(0)
         return self.ticker_response
 
 
@@ -31,10 +37,17 @@ class FakePublicApi:
             "code": "0",
             "data": [{"instId": "BTC-USDT-SWAP", "state": "live"}],
         }
+        self.time_responses = [{"code": "0", "data": [{"ts": "1714550400000"}]}]
 
     def get_instruments(self, **kwargs):
         self.calls.append(("get_instruments", kwargs))
         return self.instruments_response
+
+    def get_system_time(self):
+        self.calls.append(("get_system_time", {}))
+        if len(self.time_responses) > 1:
+            return self.time_responses.pop(0)
+        return self.time_responses[0]
 
 
 class FakeAccountApi:
@@ -45,6 +58,7 @@ class FakeAccountApi:
             "code": "0",
             "data": [{"instId": "BTC-USDT-SWAP", "pos": "1", "avgPx": "100"}],
         }
+        self.set_leverage_response = {"code": "0", "data": [{"lever": "1"}]}
 
     def get_account_balance(self, **kwargs):
         self.calls.append(("get_account_balance", kwargs))
@@ -53,6 +67,10 @@ class FakeAccountApi:
     def get_positions(self, **kwargs):
         self.calls.append(("get_positions", kwargs))
         return self.positions_response
+
+    def set_leverage(self, **kwargs):
+        self.calls.append(("set_leverage", kwargs))
+        return self.set_leverage_response
 
 
 def test_client_uses_selected_demo_credentials_and_flag(monkeypatch):
@@ -117,6 +135,17 @@ def test_get_candles_passes_okx_params_and_returns_data():
     ]
 
 
+def test_get_candles_retries_transient_okx_error_1():
+    market_api = FakeMarketApi()
+    market_api.failures = [{"code": "1", "msg": "All operations failed", "data": []}]
+    client = OkxClient(settings=Settings(), flag="1", market_api=market_api)
+
+    data = client.get_candles("BTC-USDT-SWAP", "1m", 100)
+
+    assert data == [["newer"], ["older"]]
+    assert len(market_api.calls) == 2
+
+
 def test_get_ticker_returns_first_row():
     market_api = FakeMarketApi()
     market_api.ticker_response = {
@@ -141,6 +170,26 @@ def test_get_instruments_returns_public_instrument_rows():
     assert public_api.calls == [("get_instruments", {"instType": "SWAP"})]
 
 
+def test_check_connectivity_requires_success_threshold():
+    market_api = FakeMarketApi()
+    market_api.ticker_responses = [
+        {"code": "0", "data": [{"ts": "1"}]},
+        {"code": "1", "msg": "All operations failed", "data": []},
+        {"code": "0", "data": [{"ts": "2"}]},
+    ]
+    client = OkxClient(settings=Settings(), flag="1", market_api=market_api)
+
+    ok, detail = client.check_connectivity(attempts=3, required_successes=3)
+
+    assert ok is False
+    assert "unhealthy (2/3)" in detail
+    assert market_api.calls == [
+        ("get_ticker", {"instId": "BTC-USDT-SWAP"}),
+        ("get_ticker", {"instId": "BTC-USDT-SWAP"}),
+        ("get_ticker", {"instId": "BTC-USDT-SWAP"}),
+    ]
+
+
 def test_get_positions_passes_inst_type_and_symbol():
     account_api = FakeAccountApi()
     client = OkxClient(
@@ -155,6 +204,30 @@ def test_get_positions_passes_inst_type_and_symbol():
     assert response == account_api.positions_response
     assert account_api.calls == [
         ("get_positions", {"instType": "SWAP", "instId": "BTC-USDT-SWAP"})
+    ]
+
+
+def test_set_leverage_passes_okx_account_params():
+    account_api = FakeAccountApi()
+    client = OkxClient(
+        settings=Settings(),
+        flag="1",
+        market_api=FakeMarketApi(),
+        account_api=account_api,
+    )
+
+    response = client.set_leverage(
+        "BTC-USDT-SWAP",
+        leverage=1,
+        margin_mode="cross",
+    )
+
+    assert response == account_api.set_leverage_response
+    assert account_api.calls == [
+        (
+            "set_leverage",
+            {"instId": "BTC-USDT-SWAP", "lever": "1", "mgnMode": "cross"},
+        )
     ]
 
 

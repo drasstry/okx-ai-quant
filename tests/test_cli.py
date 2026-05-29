@@ -161,7 +161,7 @@ def test_telegram_report_command_triggers_forced_daily_report():
     bot = FakeBot()
     client = FakeClient()
 
-    cli._handle_telegram_text(bot, client, "日报")
+    cli._handle_telegram_text(bot, client, "/overview")
 
     assert bot.calls == [True]
     assert client.messages == []
@@ -300,6 +300,8 @@ def test_cli_menu_shows_runtime_summary_before_continuous_bot(monkeypatch, capsy
             "08:00,20:00",
             "none",
             "2",
+            "cross",
+            "7",
             "5000",
             "0.005",
             "0.03",
@@ -332,6 +334,8 @@ def test_cli_menu_shows_runtime_summary_before_continuous_bot(monkeypatch, capsy
         "REPORT_TIMES": "08:00,20:00",
         "NOTIFIER": "none",
         "MAX_LEVERAGE": 2,
+        "MARGIN_MODE": "cross",
+        "MAX_OPEN_POSITIONS": 7,
         "REFERENCE_CAPITAL_USDT": 5000.0,
         "MAX_RISK_PER_TRADE": 0.005,
         "MAX_DAILY_LOSS": 0.03,

@@ -38,6 +38,11 @@ class TradingMode(StrEnum):
     LIVE = "live"
 
 
+class MarginMode(StrEnum):
+    CROSS = "cross"
+    ISOLATED = "isolated"
+
+
 @dataclass(frozen=True)
 class OkxCredentials:
     api_key: str
@@ -105,9 +110,13 @@ class Settings(BaseSettings):
     MANAGE_EXISTING_POSITIONS: bool = True
     POSITION_TIMEOUT_HOURS: int = Field(default=72, ge=1)
     EXIT_ON_REVERSE_SIGNAL: bool = True
+    OKX_ENTRY_HEALTHCHECK_ENABLED: bool = True
+    OKX_ENTRY_HEALTHCHECK_ATTEMPTS: int = Field(default=5, ge=1, le=10)
+    OKX_ENTRY_HEALTHCHECK_MIN_SUCCESSES: int = Field(default=5, ge=1, le=10)
     NOTIFIER: str = "console"
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_CHAT_ID: str = ""
+    TELEGRAM_PROXY_URL: str = ""
     MARKET_CANDLE_LIMIT: int = Field(default=100, ge=30)
     STRATEGY_NAME: str = "ema-rsi-atr"
 
@@ -115,7 +124,9 @@ class Settings(BaseSettings):
     MAX_RISK_PER_TRADE: float = Field(default=0.01, gt=0, le=0.02)
     MAX_DAILY_LOSS: float = Field(default=0.02, gt=0, le=0.10)
     MAX_CONSECUTIVE_LOSSES: int = Field(default=3, ge=1, le=10)
+    MAX_OPEN_POSITIONS: int = Field(default=5, ge=1, le=50)
     MAX_LEVERAGE: int = Field(default=1, ge=1)
+    MARGIN_MODE: MarginMode = MarginMode.CROSS
     FEE_RATE_PER_SIDE: float = Field(default=0.001, ge=0)
     SLIPPAGE_RATE: float = Field(default=0.001, ge=0)
     MIN_EXPECTED_MOVE: float = Field(default=0.006, gt=0)
@@ -129,6 +140,11 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def require_explicit_live_trading_opt_in(self) -> "Settings":
+        if self.OKX_ENTRY_HEALTHCHECK_MIN_SUCCESSES > self.OKX_ENTRY_HEALTHCHECK_ATTEMPTS:
+            raise ValueError(
+                "OKX_ENTRY_HEALTHCHECK_MIN_SUCCESSES must be <= "
+                "OKX_ENTRY_HEALTHCHECK_ATTEMPTS"
+            )
         if self.TRADING_MODE == TradingMode.LIVE:
             if not self.ALLOW_LIVE_TRADING:
                 raise ValueError("ALLOW_LIVE_TRADING=true is required for live trading")

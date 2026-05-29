@@ -1,6 +1,6 @@
 import pytest
 
-from okx_ai_quant.config import DEFAULT_SYMBOLS, Settings, TradingMode
+from okx_ai_quant.config import DEFAULT_SYMBOLS, MarginMode, Settings, TradingMode
 
 
 SETTINGS_ENV_VARS = (
@@ -39,16 +39,22 @@ SETTINGS_ENV_VARS = (
     "REPORT_TIMES",
     "ORDER_STALE_SECONDS",
     "MANAGE_EXISTING_POSITIONS",
+    "OKX_ENTRY_HEALTHCHECK_ENABLED",
+    "OKX_ENTRY_HEALTHCHECK_ATTEMPTS",
+    "OKX_ENTRY_HEALTHCHECK_MIN_SUCCESSES",
     "NOTIFIER",
     "TELEGRAM_BOT_TOKEN",
     "TELEGRAM_CHAT_ID",
+    "TELEGRAM_PROXY_URL",
     "MARKET_CANDLE_LIMIT",
     "STRATEGY_NAME",
     "REFERENCE_CAPITAL_USDT",
     "MAX_RISK_PER_TRADE",
     "MAX_DAILY_LOSS",
     "MAX_CONSECUTIVE_LOSSES",
+    "MAX_OPEN_POSITIONS",
     "MAX_LEVERAGE",
+    "MARGIN_MODE",
     "FEE_RATE_PER_SIDE",
     "SLIPPAGE_RATE",
     "MIN_EXPECTED_MOVE",
@@ -94,6 +100,24 @@ def test_default_symbols_include_mainstream_swaps():
 def test_max_leverage_is_capped_at_two():
     with pytest.raises(ValueError, match="MAX_LEVERAGE must be <= 2"):
         make_settings(TRADING_MODE="demo", MAX_LEVERAGE=3)
+
+
+def test_default_margin_and_position_limits_are_demo_friendly():
+    settings = make_settings()
+
+    assert settings.MARGIN_MODE == MarginMode.CROSS
+    assert settings.MAX_OPEN_POSITIONS == 5
+    assert settings.OKX_ENTRY_HEALTHCHECK_ENABLED is True
+    assert settings.OKX_ENTRY_HEALTHCHECK_ATTEMPTS == 5
+    assert settings.OKX_ENTRY_HEALTHCHECK_MIN_SUCCESSES == 5
+
+
+def test_entry_healthcheck_min_successes_cannot_exceed_attempts():
+    with pytest.raises(ValueError, match="OKX_ENTRY_HEALTHCHECK_MIN_SUCCESSES"):
+        make_settings(
+            OKX_ENTRY_HEALTHCHECK_ATTEMPTS=2,
+            OKX_ENTRY_HEALTHCHECK_MIN_SUCCESSES=3,
+        )
 
 
 def test_default_fee_rate_per_side_is_001():

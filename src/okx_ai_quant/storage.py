@@ -224,6 +224,8 @@ class SQLiteStorage:
             ("stop_loss", "REAL"),
             ("take_profit", "REAL"),
             ("expires_at", "TEXT"),
+            ("margin_mode", "TEXT"),
+            ("leverage", "INTEGER"),
             ("exit_reason", "TEXT"),
             ("closed_at", "TEXT"),
             ("realized_pnl", "REAL"),
@@ -465,6 +467,8 @@ class SQLiteStorage:
         stop_loss: float | None = None,
         take_profit: float | None = None,
         expires_at: datetime | None = None,
+        margin_mode: str | None = None,
+        leverage: int | None = None,
     ) -> int:
         side = side or (SignalDirection.SHORT if quantity < 0 else SignalDirection.LONG)
         opened_at = opened_at or updated_at
@@ -472,9 +476,9 @@ class SQLiteStorage:
             """
             INSERT INTO positions (
                 symbol, side, quantity, average_entry, state, opened_at, updated_at,
-                entry_signal_id, stop_loss, take_profit, expires_at
+                entry_signal_id, stop_loss, take_profit, expires_at, margin_mode, leverage
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(symbol) DO UPDATE SET
                 side = excluded.side,
                 quantity = excluded.quantity,
@@ -490,6 +494,8 @@ class SQLiteStorage:
                 stop_loss = COALESCE(excluded.stop_loss, positions.stop_loss),
                 take_profit = COALESCE(excluded.take_profit, positions.take_profit),
                 expires_at = COALESCE(excluded.expires_at, positions.expires_at),
+                margin_mode = COALESCE(excluded.margin_mode, positions.margin_mode),
+                leverage = COALESCE(excluded.leverage, positions.leverage),
                 exit_reason = NULL,
                 closed_at = NULL,
                 realized_pnl = NULL
@@ -506,6 +512,8 @@ class SQLiteStorage:
                 stop_loss,
                 take_profit,
                 _to_utc_text(expires_at) if expires_at is not None else None,
+                margin_mode,
+                leverage,
             ),
         )
         row = self.connection.execute(
@@ -558,12 +566,13 @@ class SQLiteStorage:
         exit_price: float,
         closed_at: datetime,
         notes: str,
+        pnl_multiplier: float = 1.0,
     ) -> PositionExitRecord | None:
         position = self.load_position(symbol)
         if position is None or position.quantity == 0:
             return None
 
-        realized_pnl = (exit_price - position.average_entry) * position.quantity
+        realized_pnl = (exit_price - position.average_entry) * position.quantity * pnl_multiplier
         abs_quantity = abs(position.quantity)
         self.connection.execute(
             """
@@ -758,23 +767,30 @@ class SQLiteStorage:
         ]
 
     def load_risk_state(self):
-        """Aggregate a lightweight RiskState from persisted orders.
+        """Aggregate the current RiskState from persisted trading state.
 
-        This is deliberately conservative for the MVP: it counts
-        non-terminal orders as "open positions" and treats the number of
-        FAILED/CANCELED orders since the last FILLED order as a proxy for
-        ``consecutive_losses``. Daily PnL aggregation requires fills data
-        and is left at 0.0 until the fills pipeline is wired in.
+        ``open_positions`` counts real tracked positions plus non-terminal
+        orders, so a filled entry keeps blocking additional new entries until
+        that position is closed. ``consecutive_losses`` remains a lightweight
+        order-state proxy until exchange PnL reconciliation is available.
         """
         from okx_ai_quant.risk import RiskState
 
-        open_rows = self.connection.execute(
+        position_rows = self.connection.execute(
+            """
+            SELECT COUNT(*) AS n FROM positions
+            WHERE state IN ('OPEN', 'CLOSING') AND ABS(quantity) > 0
+            """
+        ).fetchone()
+        pending_rows = self.connection.execute(
             """
             SELECT COUNT(*) AS n FROM orders
             WHERE state IN ('CREATED', 'SUBMITTED', 'PARTIALLY_FILLED')
             """
         ).fetchone()
-        open_positions = int(open_rows["n"]) if open_rows is not None else 0
+        open_positions = int(position_rows["n"] if position_rows is not None else 0) + int(
+            pending_rows["n"] if pending_rows is not None else 0
+        )
 
         recent_rows = self.connection.execute(
             """
@@ -840,6 +856,8 @@ class SQLiteStorage:
             stop_loss=row["stop_loss"],
             take_profit=row["take_profit"],
             expires_at=_from_utc_text(row["expires_at"]) if row["expires_at"] else None,
+            margin_mode=row["margin_mode"],
+            leverage=row["leverage"],
             exit_reason=ExitReason(row["exit_reason"]) if row["exit_reason"] else None,
             closed_at=_from_utc_text(row["closed_at"]) if row["closed_at"] else None,
             realized_pnl=row["realized_pnl"],

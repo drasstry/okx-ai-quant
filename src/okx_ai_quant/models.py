@@ -112,6 +112,8 @@ class PositionRecord:
     stop_loss: float | None = None
     take_profit: float | None = None
     expires_at: datetime | None = None
+    margin_mode: str | None = None
+    leverage: int | None = None
     exit_reason: ExitReason | None = None
     closed_at: datetime | None = None
     realized_pnl: float | None = None

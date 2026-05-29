@@ -109,6 +109,8 @@ def parse_positions_response(response: dict[str, Any]) -> list[PositionRecord]:
                 state=PositionState.OPEN,
                 opened_at=updated_at,
                 updated_at=updated_at,
+                margin_mode=str(row.get("mgnMode") or "") or None,
+                leverage=_int_or_none(row.get("lever")),
             )
         )
     return positions
@@ -139,3 +141,12 @@ def _float(value: Any) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None

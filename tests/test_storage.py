@@ -8,6 +8,7 @@ from okx_ai_quant.models import (
     FillRecord,
     OrderRecord,
     OrderState,
+    PositionState,
     RiskStatus,
     Signal,
     SignalDirection,
@@ -343,3 +344,31 @@ def test_load_trade_analyses_for_date(tmp_path):
 
         assert len(analyses) == 1
         assert analyses[0].chinese == "今日AI分析。"
+
+
+def test_load_risk_state_counts_open_positions_and_pending_orders(tmp_path):
+    with SQLiteStorage(tmp_path / "quant.sqlite3") as storage:
+        storage.initialize()
+        now = datetime(2026, 5, 26, 8, 0, tzinfo=UTC)
+        storage.upsert_position(
+            symbol="BTC-USDT-SWAP",
+            side=SignalDirection.LONG,
+            quantity=2.0,
+            average_entry=80000.0,
+            state=PositionState.OPEN,
+            opened_at=now,
+            updated_at=now,
+        )
+        storage.insert_order(
+            OrderRecord(
+                symbol="ETH-USDT-SWAP",
+                side=SignalDirection.LONG,
+                quantity=1.0,
+                state=OrderState.SUBMITTED,
+                created_at=now,
+            )
+        )
+
+        state = storage.load_risk_state()
+
+        assert state.open_positions == 2

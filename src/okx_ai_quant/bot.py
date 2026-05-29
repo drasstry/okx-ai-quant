@@ -1,12 +1,13 @@
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time as dt_time, timedelta
 from zoneinfo import ZoneInfo
 
 from okx_ai_quant.account import AccountService
 from okx_ai_quant.config import Settings
 from okx_ai_quant.execution import ExecutionDecision
+from okx_ai_quant.log_review import summarize_recent_failures
 from okx_ai_quant.market_data import normalize_ticker
 from okx_ai_quant.models import (
     ExitReason,
@@ -18,7 +19,7 @@ from okx_ai_quant.models import (
     SignalDirection,
 )
 from okx_ai_quant.notifier import NotificationError, Notifier
-from okx_ai_quant.reports import render_daily_report
+from okx_ai_quant.reports import build_trade_overview_fallback, render_trade_overview
 from okx_ai_quant.runner import RunOnceResult, Runner
 
 
@@ -38,6 +39,8 @@ class TradingBot:
         self.tz = ZoneInfo(settings.APP_TIMEZONE)
         self.account = AccountService(runner.client)
         self._tradable_symbols_cache: list[str] | None = None
+        self._blocked_leverage_updates: set[tuple[str, str, int]] = set()
+        self._entry_block_reason: str | None = None
 
     def run_forever(self) -> None:
         self.publish_runtime_status()
@@ -79,6 +82,14 @@ class TradingBot:
         self.reconcile_exchange_state()
         if self.settings.MANAGE_EXISTING_POSITIONS:
             self.monitor_positions()
+
+        self._entry_block_reason = self._okx_entry_health_block_reason()
+        if self._entry_block_reason:
+            self._notify(f"Blocking new entries this cycle: {self._entry_block_reason}")
+            return [
+                BotCycleResult(symbol=symbol, result=None, skipped_reason=self._entry_block_reason)
+                for symbol in (self._tradable_symbols_cache or self.settings.symbols)
+            ]
 
         results: list[BotCycleResult] = []
         for symbol in self._tradable_symbols():
@@ -148,11 +159,17 @@ class TradingBot:
         if storage.daily_report_exists(report_key) and not force:
             return False
 
-        metrics = self._daily_metrics(report_key)
-        analyses = storage.load_trade_analyses_for_date(report_key)
-        report = render_daily_report(report_date, metrics, analyses=analyses)
+        context = self._trade_overview_context(report_date)
+        fallback = build_trade_overview_fallback(context)
+        summary = self._generate_trade_overview_summary(context, fallback)
+        report = render_trade_overview(
+            report_date=report_date,
+            report_slot=report_slot,
+            context=context,
+            llm_summary=summary,
+        )
         storage.insert_daily_report(report_key, report, datetime.now(UTC))
-        self._notify(report)
+        self._send_report(report)
         return True
 
     def sync_tracked_orders(self) -> None:
@@ -250,10 +267,33 @@ class TradingBot:
     def monitor_positions(self) -> list[OrderRecord]:
         submitted_orders: list[OrderRecord] = []
         for position in self.runner.storage.load_open_positions():
-            decision = self._position_exit_decision(position)
+            exchange_position = self._refresh_position_from_exchange(position.symbol)
+            if exchange_position is None:
+                self._notify(
+                    f"Skip exit for {position.symbol}: OKX reports no open position."
+                )
+                continue
+            position = self._merge_position_plan(exchange_position, position)
+            try:
+                decision = self._position_exit_decision(position)
+            except Exception as exc:  # noqa: BLE001 - one position must not stop the bot loop.
+                self._notify(f"Could not evaluate exit for {position.symbol}: {exc}")
+                continue
             if decision is None:
                 continue
             reason, exit_price, notes = decision
+            existing_close = self._open_close_order(position.symbol)
+            if existing_close is not None:
+                self.runner.storage.mark_position_closing(
+                    symbol=position.symbol,
+                    reason=reason,
+                    updated_at=datetime.now(UTC),
+                )
+                self._notify(
+                    f"Close order already pending: {reason.value} {position.symbol} "
+                    f"ordId={existing_close.order_id or '-'}, clOrdId={existing_close.client_order_id or '-'}."
+                )
+                continue
             if not self.settings.ENABLE_TRADING:
                 self._notify(
                     f"Planned exit only: {reason.value} {position.symbol} "
@@ -261,10 +301,18 @@ class TradingBot:
                 )
                 continue
 
-            close_order = self.runner.execution_engine.close_position(
-                position,
-                reason=reason.value,
-            )
+            try:
+                close_order = self.runner.execution_engine.close_position(
+                    position,
+                    reason=reason.value,
+                )
+            except Exception as exc:  # noqa: BLE001 - transient exchange failures are retried next cycle.
+                self._notify(
+                    f"Close order failed: {reason.value} {position.symbol} "
+                    f"qty={abs(position.quantity):.6g}: {exc}"
+                )
+                continue
+
             self.runner.storage.insert_order(close_order)
             self.runner.storage.mark_position_closing(
                 symbol=position.symbol,
@@ -274,7 +322,7 @@ class TradingBot:
             submitted_orders.append(close_order)
             self._notify(
                 f"Submitted close order: {reason.value} {position.symbol} "
-                f"qty={abs(position.quantity):.6g}, ordId={close_order.order_id or '-'}."
+                f"qty={abs(position.quantity):.6g}, ordId={close_order.order_id or '-'}.",
             )
             self.runner.storage.set_state(
                 f"last_exit_reason:{position.symbol}",
@@ -282,6 +330,12 @@ class TradingBot:
                 datetime.now(UTC),
             )
         return submitted_orders
+
+    def _open_close_order(self, symbol: str) -> OrderRecord | None:
+        for order in self.runner.storage.load_open_orders():
+            if order.symbol == symbol and order.order_type.startswith("market_close"):
+                return order
+        return None
 
     def _pending_order_reason(self, symbol: str) -> str | None:
         try:
@@ -363,7 +417,10 @@ class TradingBot:
                 stop_loss=local.stop_loss if local is not None else None,
                 take_profit=local.take_profit if local is not None else None,
                 expires_at=local.expires_at if local is not None else None,
+                margin_mode=exchange_position.margin_mode,
+                leverage=exchange_position.leverage,
             )
+            self._enforce_position_leverage(exchange_position)
 
         for local in self.runner.storage.load_open_positions():
             if local.symbol in allowed_symbols and local.symbol not in seen_symbols:
@@ -394,19 +451,7 @@ class TradingBot:
         )
 
         if order.order_type.startswith("market_close"):
-            reason = _exit_reason_from_order_type(order.order_type)
-            exit_record = self.runner.storage.close_position(
-                symbol=order.symbol,
-                reason=reason,
-                exit_price=avg_price,
-                closed_at=datetime.now(UTC),
-                notes=f"Closed by {reason.value} from OKX fill {order.order_id}.",
-            )
-            if exit_record is not None:
-                self._notify(
-                    f"Position closed: {exit_record.reason.value} {exit_record.symbol} "
-                    f"PnL={exit_record.realized_pnl:.6g}."
-                )
+            self._record_close_fill(order, avg_price)
             return
 
         signed_quantity = fill_size if order.side == SignalDirection.LONG else -fill_size
@@ -424,9 +469,117 @@ class TradingBot:
             stop_loss=_float_or_none(plan.get("stop_loss")) if plan else None,
             take_profit=_float_or_none(plan.get("take_profit")) if plan else None,
             expires_at=expires_at,
+            margin_mode=getattr(self.runner.execution_engine, "margin_mode", None),
+            leverage=getattr(self.runner.risk_guard, "leverage", None),
             opened_at=opened_at,
             updated_at=datetime.now(UTC),
         )
+
+    def _record_close_fill(self, order: OrderRecord, avg_price: float) -> None:
+        reason = _exit_reason_from_order_type(order.order_type)
+        exchange_position = self._refresh_position_from_exchange(order.symbol)
+        if exchange_position is not None and abs(exchange_position.quantity) > 0:
+            self._notify(
+                f"Close fill received for {order.symbol}, but OKX still reports "
+                f"{exchange_position.margin_mode or '-'} position qty={exchange_position.quantity:.6g}. "
+                "Keeping local position OPEN."
+            )
+            return
+
+        exit_record = self.runner.storage.close_position(
+            symbol=order.symbol,
+            reason=reason,
+            exit_price=avg_price,
+            closed_at=datetime.now(UTC),
+            notes=f"Closed by {reason.value} from OKX fill {order.order_id}.",
+            pnl_multiplier=self._contract_pnl_multiplier(order.symbol, avg_price),
+        )
+        if exit_record is not None:
+            self._notify(
+                f"Position closed: {exit_record.reason.value} {exit_record.symbol} "
+                f"PnL={exit_record.realized_pnl:.6g}."
+            )
+
+    def _refresh_position_from_exchange(self, symbol: str) -> PositionRecord | None:
+        get_positions = getattr(self.runner.client, "get_positions", None)
+        if not callable(get_positions):
+            return self.runner.storage.load_position(symbol)
+        try:
+            from okx_ai_quant.account import parse_positions_response
+
+            positions = parse_positions_response(get_positions(inst_type="SWAP", symbol=symbol))
+        except Exception as exc:  # noqa: BLE001 - caller decides whether local fallback is acceptable.
+            self._notify(f"Could not refresh OKX position for {symbol}: {exc}")
+            return self.runner.storage.load_position(symbol)
+
+        exchange_position = next((item for item in positions if item.symbol == symbol), None)
+        if exchange_position is None:
+            return None
+
+        local = self.runner.storage.load_position(symbol)
+        merged = self._merge_position_plan(exchange_position, local)
+        self.runner.storage.upsert_position(
+            symbol=merged.symbol,
+            side=merged.side,
+            quantity=merged.quantity,
+            average_entry=merged.average_entry,
+            opened_at=merged.opened_at,
+            updated_at=merged.updated_at,
+            entry_signal_id=merged.entry_signal_id,
+            stop_loss=merged.stop_loss,
+            take_profit=merged.take_profit,
+            expires_at=merged.expires_at,
+            margin_mode=merged.margin_mode,
+            leverage=merged.leverage,
+        )
+        self._enforce_position_leverage(merged)
+        return merged
+
+    def _merge_position_plan(
+        self,
+        exchange_position: PositionRecord,
+        local: PositionRecord | None,
+    ) -> PositionRecord:
+        if local is None:
+            return exchange_position
+        return replace(
+            exchange_position,
+            opened_at=local.opened_at,
+            entry_signal_id=local.entry_signal_id,
+            stop_loss=local.stop_loss,
+            take_profit=local.take_profit,
+            expires_at=local.expires_at,
+        )
+
+    def _enforce_position_leverage(self, position: PositionRecord) -> None:
+        if position.leverage == self.settings.MAX_LEVERAGE:
+            return
+        margin_mode = position.margin_mode
+        if not margin_mode:
+            return
+        key = (position.symbol, margin_mode, self.settings.MAX_LEVERAGE)
+        if key in self._blocked_leverage_updates:
+            return
+        set_leverage = getattr(self.runner.client, "set_leverage", None)
+        if not callable(set_leverage):
+            return
+        try:
+            set_leverage(
+                position.symbol,
+                leverage=self.settings.MAX_LEVERAGE,
+                margin_mode=margin_mode,
+            )
+            self._notify(
+                f"Updated OKX leverage: {position.symbol} {margin_mode} "
+                f"{position.leverage or '-'}x -> {self.settings.MAX_LEVERAGE}x."
+            )
+        except Exception as exc:  # noqa: BLE001 - leverage correction should not stop exits.
+            if "59103" in str(exc):
+                self._blocked_leverage_updates.add(key)
+            self._notify(
+                f"Could not update OKX leverage for {position.symbol} "
+                f"{margin_mode}: {exc}"
+            )
 
     def _position_exit_decision(
         self,
@@ -542,6 +695,182 @@ class TradingBot:
             keys.append(f"entry_plan:order:{order.order_id}")
         return keys
 
+    def _trade_overview_context(self, report_date: date) -> dict[str, object]:
+        report_day = report_date.isoformat()
+        balance = self.runner.storage.load_balance("USDT")
+        risk_state = self.runner._resolve_risk_state()
+        open_positions = [
+            self._position_overview(position)
+            for position in self.runner.storage.load_open_positions()
+        ]
+        total_unrealized = sum(float(item["unrealized_pnl_usdt"]) for item in open_positions)
+        closed_positions = [
+            self._exit_overview(exit_record)
+            for exit_record in self.runner.storage.load_position_exits()
+            if exit_record.closed_at.date().isoformat() == report_day
+        ]
+        realized = sum(float(item["realized_pnl_usdt"]) for item in closed_positions)
+        orders = self._order_counts(report_day)
+        risk_points = self._risk_points(
+            open_positions=open_positions,
+            risk_state=risk_state,
+            total_unrealized=total_unrealized,
+        )
+        return {
+            "generated_at": datetime.now(self.tz).isoformat(timespec="seconds"),
+            "report_date": report_day,
+            "mode": str(self.settings.TRADING_MODE),
+            "trading_enabled": self.settings.ENABLE_TRADING,
+            "strategy": self.settings.STRATEGY_NAME,
+            "account": {
+                "equity_usdt": _fmt(balance.equity) if balance is not None else "-",
+                "available_usdt": _fmt(balance.available) if balance is not None else "-",
+            },
+            "totals": {
+                "open_position_count": len(open_positions),
+                "unrealized_pnl_usdt": _fmt(total_unrealized),
+                "realized_pnl_usdt": _fmt(realized),
+                "risk_state_open_positions": risk_state.open_positions,
+                "consecutive_losses": risk_state.consecutive_losses,
+                "max_daily_loss": self.settings.MAX_DAILY_LOSS,
+                "max_risk_per_trade": self.settings.MAX_RISK_PER_TRADE,
+                "max_open_positions": self.settings.MAX_OPEN_POSITIONS,
+                "max_leverage": self.settings.MAX_LEVERAGE,
+                "margin_mode": str(self.settings.MARGIN_MODE),
+            },
+            "orders": orders,
+            "open_positions": open_positions,
+            "closed_positions": closed_positions,
+            "risk_points": risk_points,
+            "failure_review": self._failure_review(),
+        }
+
+    def _position_overview(self, position: PositionRecord) -> dict[str, object]:
+        mark_price = self._latest_market_price(position.symbol)
+        multiplier = self._contract_pnl_multiplier(position.symbol, mark_price)
+        unrealized = 0.0
+        if mark_price > 0:
+            unrealized = (mark_price - position.average_entry) * position.quantity * multiplier
+        return {
+            "symbol": position.symbol,
+            "side": position.side.value,
+            "quantity": _fmt(position.quantity),
+            "entry_price": _fmt(position.average_entry),
+            "mark_price": _fmt(mark_price) if mark_price > 0 else "-",
+            "unrealized_pnl_usdt": _fmt(unrealized),
+            "stop_loss": _fmt(position.stop_loss) if position.stop_loss is not None else "-",
+            "take_profit": _fmt(position.take_profit) if position.take_profit is not None else "-",
+            "margin_mode": position.margin_mode or "-",
+            "leverage": position.leverage if position.leverage is not None else "-",
+            "state": position.state.value,
+            "updated_at": position.updated_at.isoformat(),
+        }
+
+    def _exit_overview(self, exit_record) -> dict[str, object]:
+        return {
+            "symbol": exit_record.symbol,
+            "side": exit_record.side.value,
+            "reason": exit_record.reason.value,
+            "quantity": _fmt(exit_record.quantity),
+            "entry_price": _fmt(exit_record.entry_price),
+            "exit_price": _fmt(exit_record.exit_price),
+            "realized_pnl_usdt": _fmt(exit_record.realized_pnl),
+            "closed_at": exit_record.closed_at.isoformat(),
+        }
+
+    def _order_counts(self, report_day: str) -> dict[str, int]:
+        rows = self.runner.storage.connection.execute(
+            """
+            SELECT lower(state) AS state, COUNT(*) AS n
+            FROM orders
+            WHERE substr(created_at, 1, 10) = ?
+            GROUP BY lower(state)
+            """,
+            (report_day,),
+        ).fetchall()
+        counts = {str(row["state"]): int(row["n"]) for row in rows}
+        for state in ("filled", "canceled", "submitted", "created", "partially_filled", "failed"):
+            counts.setdefault(state, 0)
+        return counts
+
+    def _risk_points(
+        self,
+        *,
+        open_positions: list[dict[str, object]],
+        risk_state,
+        total_unrealized: float,
+    ) -> list[str]:
+        points: list[str] = []
+        if risk_state.open_positions >= self.settings.MAX_OPEN_POSITIONS:
+            points.append(
+                f"当前风控 open_positions={risk_state.open_positions}，"
+                f"已达到 MAX_OPEN_POSITIONS={self.settings.MAX_OPEN_POSITIONS}，会阻止继续新增仓位。"
+            )
+        if risk_state.consecutive_losses >= self.settings.MAX_CONSECUTIVE_LOSSES:
+            points.append(
+                f"连续失败/亏损计数 {risk_state.consecutive_losses} 已达到限制。"
+            )
+        if total_unrealized < 0:
+            points.append(f"当前持仓估算浮亏 {abs(total_unrealized):.2f} USDT。")
+        for item in open_positions:
+            side = str(item["side"])
+            mark = _float(item["mark_price"])
+            stop = _float(item["stop_loss"])
+            symbol = str(item["symbol"])
+            if mark <= 0 or stop <= 0:
+                continue
+            if side == "LONG" and mark <= stop * 1.01:
+                points.append(f"{symbol} LONG 接近/触及止损：mark={mark:g}, stop={stop:g}。")
+            if side == "SHORT" and mark >= stop * 0.99:
+                points.append(f"{symbol} SHORT 接近/触及止损：mark={mark:g}, stop={stop:g}。")
+        return points
+
+    def _failure_review(self) -> dict[str, object]:
+        log_dir = self.settings.DB_PATH.parent
+        return summarize_recent_failures(
+            [
+                log_dir / "okxbot.log",
+                log_dir / "okxbot-telegram.log",
+            ]
+        )
+
+    def _generate_trade_overview_summary(
+        self,
+        context: dict[str, object],
+        fallback: str,
+    ) -> str:
+        llm_client = getattr(self.runner.analysis_generator, "llm_client", None)
+        generator = getattr(llm_client, "generate_trade_overview", None)
+        if not callable(generator):
+            return fallback
+        try:
+            return generator(context=context, fallback_chinese=fallback)
+        except Exception as exc:  # noqa: BLE001 - reports must still be delivered without LLM.
+            return f"{fallback}\n\n大模型总结暂时不可用：{exc}"
+
+    def _contract_pnl_multiplier(self, symbol: str, mark_price: float) -> float:
+        get_instruments = getattr(self.runner.client, "get_instruments", None)
+        if not callable(get_instruments):
+            return 1.0
+        try:
+            rows = get_instruments("SWAP")
+        except Exception:
+            return 1.0
+        base_ccy = symbol.split("-", maxsplit=1)[0].upper()
+        for row in rows:
+            if not isinstance(row, dict) or row.get("instId") != symbol:
+                continue
+            ct_val = _float(row.get("ctVal"))
+            ct_val_ccy = str(row.get("ctValCcy") or "").upper()
+            if ct_val <= 0:
+                return 1.0
+            if ct_val_ccy == base_ccy:
+                return ct_val
+            if ct_val_ccy in {"USDT", "USD", "USDC"} and mark_price > 0:
+                return ct_val / mark_price
+            return 1.0
+        return 1.0
+
     def _daily_metrics(self, report_date: str) -> dict[str, object]:
         rows = self.runner.storage.connection.execute(
             """
@@ -569,11 +898,52 @@ class TradingBot:
         if callable(sync):
             sync()
 
-    def _notify(self, message: str) -> None:
+    def _okx_entry_health_block_reason(self) -> str | None:
+        if not self.settings.ENABLE_TRADING or not self.settings.OKX_ENTRY_HEALTHCHECK_ENABLED:
+            return None
+        check_connectivity = getattr(self.runner.client, "check_connectivity", None)
+        if not callable(check_connectivity):
+            return None
+        ok, details = check_connectivity(
+            attempts=self.settings.OKX_ENTRY_HEALTHCHECK_ATTEMPTS,
+            required_successes=self.settings.OKX_ENTRY_HEALTHCHECK_MIN_SUCCESSES,
+            symbol=self.settings.symbols[0] if self.settings.symbols else "BTC-USDT-SWAP",
+        )
+        if ok:
+            return None
+        return details
+
+    def _send_report(self, message: str) -> None:
         try:
             self.notifier.send(message)
-        except NotificationError:
+        except NotificationError as exc:
+            print(f"Report notification failed: {exc}")
+        except Exception as exc:  # noqa: BLE001 - report delivery must not stop the bot.
+            print(f"Report notification failed unexpectedly: {exc}")
+
+    def _notify(self, message: str) -> None:
+        if self.settings.NOTIFIER.strip().lower() == "telegram":
+            print(_timestamped_log(message))
             return
+        try:
+            self.notifier.send(message)
+        except NotificationError as exc:
+            print(_timestamped_log(f"Notification failed: {exc}"))
+        except Exception as exc:  # noqa: BLE001 - notifications must never stop trading logic.
+            print(_timestamped_log(f"Notification failed unexpectedly: {exc}"))
+
+
+def _fmt(value: object, digits: int = 2) -> str:
+    number = _float(value)
+    if abs(number) >= 1000:
+        return f"{number:.2f}"
+    if abs(number) >= 1:
+        return f"{number:.4f}".rstrip("0").rstrip(".")
+    return f"{number:.6f}".rstrip("0").rstrip(".") or "0"
+
+
+def _timestamped_log(message: str) -> str:
+    return f"[{datetime.now(UTC).isoformat(timespec='seconds')}] {message}"
 
 
 def _map_okx_order_state(value: object) -> OrderState | None:

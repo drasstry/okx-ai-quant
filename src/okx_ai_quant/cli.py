@@ -59,6 +59,7 @@ def build_runner(
         max_risk_per_trade=settings.MAX_RISK_PER_TRADE,
         max_daily_loss=settings.MAX_DAILY_LOSS,
         max_consecutive_losses=settings.MAX_CONSECUTIVE_LOSSES,
+        max_positions=settings.MAX_OPEN_POSITIONS,
         leverage=settings.MAX_LEVERAGE,
     )
 
@@ -67,7 +68,7 @@ def build_runner(
         storage=storage,
         strategy=strategy,
         risk_guard=risk_guard,
-        execution_engine=ExecutionEngine(client),
+        execution_engine=ExecutionEngine(client, margin_mode=settings.MARGIN_MODE),
         analysis_generator=TradeAnalysisGenerator(
             llm_client=OpenAICompatibleLLMClient.from_settings(settings)
         ),
@@ -97,21 +98,31 @@ def run_telegram_listener(*, mode: str | None = None, timeout: int = 25) -> None
     client = TelegramBotClient(
         bot_token=bot.settings.TELEGRAM_BOT_TOKEN,
         chat_id=bot.settings.TELEGRAM_CHAT_ID,
+        proxy_url=bot.settings.TELEGRAM_PROXY_URL,
     )
+    consecutive_failures = 0
+    retry_delay = 5
     try:
         raw_offset = bot.runner.storage.get_state("telegram:last_update_id")
         offset = int(raw_offset) + 1 if raw_offset is not None else None
-        client.send(
-            "OKX AI Quant Telegram listener started. "
-            "Send /report, 日报, 总结, or /status."
-        )
+        print("OKX AI Quant Telegram listener started. Commands: /overview, /report, 概览, 总结, /status.")
         while True:
             try:
                 updates = client.get_updates(offset=offset, timeout=timeout)
             except NotificationError as exc:
-                print(exc)
-                time.sleep(5)
+                consecutive_failures += 1
+                if consecutive_failures <= 3 or consecutive_failures % 20 == 0:
+                    print(
+                        f"{exc} (consecutive={consecutive_failures}, "
+                        f"next_retry={retry_delay}s)"
+                    )
+                time.sleep(retry_delay)
+                retry_delay = min(300, retry_delay * 2)
                 continue
+            if consecutive_failures:
+                print(f"Telegram polling recovered after {consecutive_failures} failure(s).")
+            consecutive_failures = 0
+            retry_delay = 5
 
             for update in updates:
                 offset = update.update_id + 1
@@ -128,15 +139,15 @@ def run_telegram_listener(*, mode: str | None = None, timeout: int = 25) -> None
 def _handle_telegram_text(bot: TradingBot, client: TelegramBotClient, text: str) -> None:
     normalized = text.strip().lower()
     command = normalized.split(maxsplit=1)[0].split("@", maxsplit=1)[0]
-    if command in {"/report", "/daily", "/summary"} or any(
-        keyword in normalized for keyword in ("日报", "报告", "总结", "分析")
+    if command in {"/overview", "/report", "/daily", "/summary"} or any(
+        keyword in normalized for keyword in ("概览", "日报", "报告", "总结", "分析")
     ):
         bot.send_daily_report(force=True)
         return
     if command == "/status":
         client.send(_telegram_status_message(bot))
         return
-    client.send("Supported commands: /report, 日报, 总结, /status")
+    client.send("Supported commands: /overview, /report, 概览, 总结, /status")
 
 
 def _telegram_status_message(bot: TradingBot) -> str:
@@ -424,6 +435,17 @@ def _prompt_continuous_bot_overrides(settings: Settings, *, language: str = "en"
         default=settings.NOTIFIER if settings.NOTIFIER in {"console", "telegram", "none"} else "console",
     )
     leverage = _prompt_int("最大杠杆" if language == "zh" else "Max leverage", default=settings.MAX_LEVERAGE, minimum=1, maximum=2)
+    margin_mode = _prompt_choice(
+        "保证金模式" if language == "zh" else "Margin mode",
+        ["cross", "isolated"],
+        default=str(settings.MARGIN_MODE),
+    )
+    max_open_positions = _prompt_int(
+        "最大同时持仓数" if language == "zh" else "Max open positions",
+        default=settings.MAX_OPEN_POSITIONS,
+        minimum=1,
+        maximum=50,
+    )
     reference_capital = _prompt_float(
         "参考资金 USDT" if language == "zh" else "Reference capital USDT",
         default=settings.REFERENCE_CAPITAL_USDT,
@@ -498,6 +520,8 @@ def _prompt_continuous_bot_overrides(settings: Settings, *, language: str = "en"
         "REPORT_TIMES": report_times,
         "NOTIFIER": notifier,
         "MAX_LEVERAGE": leverage,
+        "MARGIN_MODE": margin_mode,
+        "MAX_OPEN_POSITIONS": max_open_positions,
         "REFERENCE_CAPITAL_USDT": reference_capital,
         "MAX_RISK_PER_TRADE": max_risk,
         "MAX_DAILY_LOSS": max_daily_loss,
@@ -518,6 +542,8 @@ def _runtime_summary(settings: Settings, *, language: str = "en") -> str:
             f"  轮询间隔: {settings.POLL_INTERVAL_SECONDS}s\n"
             f"  报告时间: {', '.join(settings.report_times)}\n"
             f"  最大杠杆: {settings.MAX_LEVERAGE}x\n"
+            f"  保证金模式: {settings.MARGIN_MODE}\n"
+            f"  最大同时持仓数: {settings.MAX_OPEN_POSITIONS}\n"
             f"  参考资金: {settings.REFERENCE_CAPITAL_USDT:g} USDT\n"
             f"  单笔最大风险: {settings.MAX_RISK_PER_TRADE:.2%}\n"
             f"  日内最大亏损: {settings.MAX_DAILY_LOSS:.2%}\n"
@@ -537,6 +563,8 @@ def _runtime_summary(settings: Settings, *, language: str = "en") -> str:
         f"  poll interval: {settings.POLL_INTERVAL_SECONDS}s\n"
         f"  report times: {', '.join(settings.report_times)}\n"
         f"  max leverage: {settings.MAX_LEVERAGE}x\n"
+        f"  margin mode: {settings.MARGIN_MODE}\n"
+        f"  max open positions: {settings.MAX_OPEN_POSITIONS}\n"
         f"  reference capital: {settings.REFERENCE_CAPITAL_USDT:g} USDT\n"
         f"  max risk per trade: {settings.MAX_RISK_PER_TRADE:.2%}\n"
         f"  max daily loss: {settings.MAX_DAILY_LOSS:.2%}\n"

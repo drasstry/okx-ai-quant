@@ -64,6 +64,45 @@ class OpenAICompatibleLLMClient:
             raise RuntimeError("LLM response missing english/chinese fields")
         return english, chinese
 
+    def generate_trade_overview(
+        self,
+        *,
+        context: dict[str, Any],
+        fallback_chinese: str,
+    ) -> str:
+        from openai import OpenAI
+
+        client = OpenAI(base_url=self.base_url, api_key=self.api_key)
+        prompt = (
+            "你是谨慎的加密货币量化交易风控助手。"
+            "请基于下面的系统交易快照，生成一份适合 Telegram 推送的中文交易概览。"
+            "必须覆盖：现有持仓、估算盈亏、今日交易结果、主要风险点、"
+            "最近失败日志原因复盘、可能影响交易执行的稳定性问题、下一步观察重点。"
+            "如果日志里有 OKX API、SSL、timeout、Telegram 或订单失败，要明确点名。"
+            "不要逐笔复述所有交易，不要给投资建议，不要承诺收益。"
+            "控制在 500 字以内。Return strict JSON with key summary.\n\n"
+            f"Context: {json.dumps(_json_ready(context), ensure_ascii=False, sort_keys=True)}\n"
+            f"Deterministic fallback: {fallback_chinese}"
+        )
+        try:
+            response = client.responses.create(
+                model=self.model,
+                input=[{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
+            )
+            text = _extract_response_text(response)
+        except _RESPONSES_API_UNSUPPORTED_ERRORS:
+            response = client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+            )
+            text = _extract_chat_completion_text(response)
+        parsed = json.loads(text)
+        summary = str(parsed.get("summary", "")).strip()
+        if not summary:
+            raise RuntimeError("LLM response missing summary field")
+        return summary
+
 
 def _responses_api_unsupported_errors() -> tuple[type[BaseException], ...]:
     """Return the tuple of error classes that mean "retry via chat.completions".
