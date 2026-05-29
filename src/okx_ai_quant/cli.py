@@ -283,7 +283,7 @@ def run_wizard() -> int:
     )
     default_symbol = settings.symbols[0] if settings.symbols else "BTC-USDT-SWAP"
     symbol = _prompt_text("Symbol", default=default_symbol)
-    leverage = _prompt_int("Leverage", default=settings.MAX_LEVERAGE, minimum=1, maximum=2)
+    leverage = _prompt_int("Leverage", default=settings.MAX_LEVERAGE, minimum=1, maximum=125)
 
     print(
         "\nSummary:\n"
@@ -434,7 +434,12 @@ def _prompt_continuous_bot_overrides(settings: Settings, *, language: str = "en"
         ["console", "telegram", "none"],
         default=settings.NOTIFIER if settings.NOTIFIER in {"console", "telegram", "none"} else "console",
     )
-    leverage = _prompt_int("最大杠杆" if language == "zh" else "Max leverage", default=settings.MAX_LEVERAGE, minimum=1, maximum=2)
+    leverage = _prompt_int(
+        "最大杠杆" if language == "zh" else "Max leverage",
+        default=settings.MAX_LEVERAGE,
+        minimum=1,
+        maximum=125,
+    )
     margin_mode = _prompt_choice(
         "保证金模式" if language == "zh" else "Margin mode",
         ["cross", "isolated"],
@@ -604,7 +609,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     run_once.add_argument(
         "--leverage",
         type=int,
-        choices=[1, 2],
         default=None,
         help="Override leverage for this run",
     )

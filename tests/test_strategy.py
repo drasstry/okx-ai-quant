@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 from okx_ai_quant.models import Candle, Signal, SignalDirection
 from okx_ai_quant.strategy import (
     AVAILABLE_STRATEGIES,
+    CrossSectionalMomentumFundingStrategy,
     DonchianBreakoutStrategy,
     EmaMomentumStrategy,
     EmaRsiAtrStrategy,
@@ -101,6 +102,7 @@ def test_strategy_factory_lists_supported_strategies():
         "ema-momentum",
         "multi-timeframe-trend",
         "volatility-adjusted-momentum",
+        "cross-sectional-momentum-funding",
     )
     assert isinstance(create_strategy("ema-rsi-atr", min_expected_move=0.006), EmaRsiAtrStrategy)
     assert isinstance(
@@ -120,6 +122,10 @@ def test_strategy_factory_lists_supported_strategies():
         create_strategy("volatility-adjusted-momentum", min_expected_move=0.006),
         VolatilityAdjustedMomentumStrategy,
     )
+    assert isinstance(
+        create_strategy("cross-sectional-momentum-funding", min_expected_move=0.006),
+        CrossSectionalMomentumFundingStrategy,
+    )
 
 
 def test_strategy_factory_rejects_unknown_strategy():
@@ -129,6 +135,96 @@ def test_strategy_factory_rejects_unknown_strategy():
         assert "Unknown strategy" in str(exc)
     else:
         raise AssertionError("create_strategy should reject unknown names")
+
+
+def test_cross_sectional_momentum_funding_selects_tails_and_recommends_leverage():
+    symbols = [
+        "BTC-USDT-SWAP",
+        "ETH-USDT-SWAP",
+        "SOL-USDT-SWAP",
+        "XRP-USDT-SWAP",
+        "ADA-USDT-SWAP",
+    ]
+    closes = {
+        "BTC-USDT-SWAP": [100, 102, 104, 107, 111, 116, 122, 129, 137, 146],
+        "ETH-USDT-SWAP": [100, 101, 102, 103, 104, 105, 106, 107, 108, 109],
+        "SOL-USDT-SWAP": [100, 100, 101, 100, 101, 100, 101, 100, 101, 100],
+        "XRP-USDT-SWAP": [160, 153, 146, 139, 132, 125, 118, 111, 104, 97],
+        "ADA-USDT-SWAP": [110, 108, 106, 104, 102, 100, 98, 96, 94, 92],
+    }
+    one_hour = {
+        symbol: _candles(symbol, "1H", values)
+        for symbol, values in closes.items()
+    }
+    strategy = CrossSectionalMomentumFundingStrategy(
+        min_expected_move=0.005,
+        momentum_lookback=3,
+        volatility_lookback=3,
+        atr_period=3,
+        min_universe_size=5,
+    )
+
+    strategy.prepare_universe(
+        symbols=symbols,
+        one_hour=one_hour,
+        four_hour={symbol: _candles(symbol, "4H", values) for symbol, values in closes.items()},
+        funding_rates={
+            "BTC-USDT-SWAP": 0.0001,
+            "XRP-USDT-SWAP": -0.0001,
+        },
+    )
+
+    long_signal = strategy.generate("BTC-USDT-SWAP", one_hour["BTC-USDT-SWAP"], [])
+    short_signal = strategy.generate("XRP-USDT-SWAP", one_hour["XRP-USDT-SWAP"], [])
+    middle_signal = strategy.generate("SOL-USDT-SWAP", one_hour["SOL-USDT-SWAP"], [])
+
+    assert long_signal.direction == SignalDirection.LONG
+    assert long_signal.recommended_leverage >= 1
+    assert "cross-sectional momentum" in long_signal.reason.lower()
+    assert short_signal.direction == SignalDirection.SHORT
+    assert short_signal.recommended_leverage >= 1
+    assert middle_signal.direction == SignalDirection.HOLD
+
+
+def test_cross_sectional_momentum_funding_blocks_crowded_long_funding():
+    symbols = [
+        "BTC-USDT-SWAP",
+        "ETH-USDT-SWAP",
+        "SOL-USDT-SWAP",
+        "XRP-USDT-SWAP",
+        "ADA-USDT-SWAP",
+    ]
+    closes = {
+        "BTC-USDT-SWAP": [100, 102, 104, 107, 111, 116, 122, 129, 137, 146],
+        "ETH-USDT-SWAP": [100, 101, 102, 103, 104, 105, 106, 107, 108, 109],
+        "SOL-USDT-SWAP": [100, 100, 101, 100, 101, 100, 101, 100, 101, 100],
+        "XRP-USDT-SWAP": [160, 153, 146, 139, 132, 125, 118, 111, 104, 97],
+        "ADA-USDT-SWAP": [110, 108, 106, 104, 102, 100, 98, 96, 94, 92],
+    }
+    one_hour = {
+        symbol: _candles(symbol, "1H", values)
+        for symbol, values in closes.items()
+    }
+    strategy = CrossSectionalMomentumFundingStrategy(
+        min_expected_move=0.005,
+        momentum_lookback=3,
+        volatility_lookback=3,
+        atr_period=3,
+        min_universe_size=5,
+        max_long_funding_rate=0.0008,
+    )
+
+    strategy.prepare_universe(
+        symbols=symbols,
+        one_hour=one_hour,
+        four_hour={symbol: _candles(symbol, "4H", values) for symbol, values in closes.items()},
+        funding_rates={"BTC-USDT-SWAP": 0.0020},
+    )
+
+    signal = strategy.generate("BTC-USDT-SWAP", one_hour["BTC-USDT-SWAP"], [])
+
+    assert signal.direction == SignalDirection.HOLD
+    assert "funding filter" in signal.reason.lower()
 
 
 def test_rsi_bollinger_reversion_generates_long_on_oversold_lower_band():

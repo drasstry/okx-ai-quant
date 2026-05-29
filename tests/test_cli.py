@@ -251,6 +251,7 @@ def test_telegram_status_prefers_active_bot_runtime_state():
 
 def test_cli_menu_quits_after_showing_config(monkeypatch, capsys):
     answers = iter(["en", "q"])
+    monkeypatch.setenv("STRATEGY_NAME", "ema-rsi-atr")
     monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
 
     exit_code = main(["menu"])
@@ -264,6 +265,7 @@ def test_cli_menu_quits_after_showing_config(monkeypatch, capsys):
 
 def test_cli_menu_can_show_chinese(monkeypatch, capsys):
     answers = iter(["zh", "q"])
+    monkeypatch.setenv("STRATEGY_NAME", "ema-rsi-atr")
     monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
 
     exit_code = main(["menu"])

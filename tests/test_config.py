@@ -97,9 +97,10 @@ def test_default_symbols_include_mainstream_swaps():
     assert "INJ-USDT-SWAP" in settings.symbols
 
 
-def test_max_leverage_is_capped_at_two():
-    with pytest.raises(ValueError, match="MAX_LEVERAGE must be <= 2"):
-        make_settings(TRADING_MODE="demo", MAX_LEVERAGE=3)
+def test_max_leverage_can_be_configured_above_two():
+    settings = make_settings(TRADING_MODE="demo", MAX_LEVERAGE=5)
+
+    assert settings.MAX_LEVERAGE == 5
 
 
 def test_default_margin_and_position_limits_are_demo_friendly():

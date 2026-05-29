@@ -35,9 +35,9 @@ OKX AI Quant aims for the middle:
 
 ## Features
 
-- Fetch OKX ticker data and `1H` / `4H` candles.
+- Fetch OKX ticker data, funding rates, and `1H` / `4H` candles.
 - Scan multiple OKX USDT perpetual swap instruments.
-- Run six built-in strategies across trend, momentum, breakout, and mean-reversion styles.
+- Run seven built-in strategies across trend, momentum, breakout, mean-reversion, and cross-sectional styles.
 - Estimate fees, slippage, and minimum expected move.
 - Enforce risk limits for per-trade risk, daily loss, consecutive losses, max open positions, and leverage.
 - Convert USDT notional into OKX contract size using instrument metadata such as `ctVal`, `lotSz`, and `minSz`.
@@ -104,6 +104,7 @@ src/okx_ai_quant/
 | `ema-momentum` | Momentum | EMA direction and recent price momentum agree |
 | `multi-timeframe-trend` | Multi-timeframe trend | `4H` and `1H` EMA stacks align |
 | `volatility-adjusted-momentum` | Volatility-filtered momentum | Momentum must clear ATR noise |
+| `cross-sectional-momentum-funding` | Cross-sectional momentum | Ranks the symbol universe, trades the strongest/weakest tails, filters expensive funding, and scales leverage down when volatility rises |
 
 Every strategy returns `LONG`, `SHORT`, or `HOLD`.<br>
 Even when a strategy returns `LONG` or `SHORT`, the order still needs to pass the risk guard before execution.
@@ -146,7 +147,7 @@ OKX_DEMO_API_SECRET=your_demo_api_secret
 OKX_DEMO_API_PASSPHRASE=your_demo_api_passphrase
 
 ENABLE_TRADING=false
-STRATEGY_NAME=ema-rsi-atr
+STRATEGY_NAME=cross-sectional-momentum-funding
 SYMBOLS=BTC-USDT-SWAP,ETH-USDT-SWAP,SOL-USDT-SWAP
 
 REFERENCE_CAPITAL_USDT=1000
@@ -276,11 +277,16 @@ OKX_LIVE_API_PASSPHRASE=your_live_passphrase
 | `MAX_DAILY_LOSS` | `0.02` | Maximum daily loss ratio |
 | `MAX_CONSECUTIVE_LOSSES` | `3` | New-entry throttle after consecutive losses |
 | `MAX_OPEN_POSITIONS` | `5` | Maximum simultaneous open positions |
-| `MAX_LEVERAGE` | `1` | Maximum leverage; code-level cap is `2x` |
+| `MAX_LEVERAGE` | `1` | Maximum leverage cap used by the risk guard and OKX leverage setup |
 | `MARGIN_MODE` | `cross` | OKX margin mode: `cross` or `isolated` |
 | `OKX_ENTRY_HEALTHCHECK_*` | `5/5` | OKX market-data connectivity check before entries |
 
 Risk controls block new entries. They should not block reduce-only exits for existing positions.
+
+For strategies that do not recommend leverage, approved entries use `MAX_LEVERAGE`.
+`cross-sectional-momentum-funding` recommends leverage from recent realized volatility:
+lower volatility can use more leverage, higher volatility falls back toward `1x`, and
+`MAX_LEVERAGE` remains the hard upper bound written to OKX before order submission.
 
 ### Telegram and LLM
 

@@ -66,6 +66,19 @@ class OkxClient:
         rows = self._response_data(response, "instrument")
         return [row for row in rows if isinstance(row, dict)]
 
+    def get_funding_rate(self, symbol: str) -> float:
+        if self.public_api is None:
+            raise RuntimeError("OKX public data API is not configured")
+        response = self._call_with_retries(
+            "get_funding_rate",
+            lambda: self.public_api.get_funding_rate(instId=symbol),
+        )
+        row = self._first_response_row(response, "funding rate")
+        try:
+            return float(row.get("fundingRate") or 0.0)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"OKX API response has invalid fundingRate for {symbol}") from exc
+
     def get_balance(self, currency: str | None = None) -> dict[str, Any]:
         if self.account_api is None:
             raise RuntimeError("OKX account API is not configured")

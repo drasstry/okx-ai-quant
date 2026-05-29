@@ -37,6 +37,10 @@ class FakePublicApi:
             "code": "0",
             "data": [{"instId": "BTC-USDT-SWAP", "state": "live"}],
         }
+        self.funding_rate_response = {
+            "code": "0",
+            "data": [{"instId": "BTC-USDT-SWAP", "fundingRate": "0.00025"}],
+        }
         self.time_responses = [{"code": "0", "data": [{"ts": "1714550400000"}]}]
 
     def get_instruments(self, **kwargs):
@@ -48,6 +52,10 @@ class FakePublicApi:
         if len(self.time_responses) > 1:
             return self.time_responses.pop(0)
         return self.time_responses[0]
+
+    def get_funding_rate(self, **kwargs):
+        self.calls.append(("get_funding_rate", kwargs))
+        return self.funding_rate_response
 
 
 class FakeAccountApi:
@@ -168,6 +176,16 @@ def test_get_instruments_returns_public_instrument_rows():
 
     assert rows == [{"instId": "BTC-USDT-SWAP", "state": "live"}]
     assert public_api.calls == [("get_instruments", {"instType": "SWAP"})]
+
+
+def test_get_funding_rate_returns_float():
+    public_api = FakePublicApi()
+    client = OkxClient(settings=Settings(), flag="1", market_api=FakeMarketApi(), public_api=public_api)
+
+    funding_rate = client.get_funding_rate("BTC-USDT-SWAP")
+
+    assert funding_rate == 0.00025
+    assert public_api.calls == [("get_funding_rate", {"instId": "BTC-USDT-SWAP"})]
 
 
 def test_check_connectivity_requires_success_threshold():

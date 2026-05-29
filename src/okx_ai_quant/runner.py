@@ -46,6 +46,7 @@ class Runner:
         self.candle_limit = candle_limit
         self.enable_trading = enable_trading
         self.journal = Journal(storage)
+        self._cycle_candle_cache: dict[tuple[str, str], list] = {}
 
     def close(self) -> None:
         """Release resources held by the runner (currently the storage)."""
@@ -118,10 +119,37 @@ class Runner:
             order=order,
         )
 
+    def prepare_universe(self, symbols: list[str]) -> None:
+        prepare = getattr(self.strategy, "prepare_universe", None)
+        if not callable(prepare):
+            return
+
+        self._cycle_candle_cache = {}
+        one_hour: dict[str, list] = {}
+        four_hour: dict[str, list] = {}
+        funding_rates: dict[str, float] = {}
+        for symbol in symbols:
+            one_hour[symbol] = self._fetch_store_candles(symbol, "1H")
+            four_hour[symbol] = self._fetch_store_candles(symbol, "4H")
+            funding_rate = self._fetch_funding_rate(symbol)
+            if funding_rate is not None:
+                funding_rates[symbol] = funding_rate
+
+        prepare(
+            symbols=symbols,
+            one_hour=one_hour,
+            four_hour=four_hour,
+            funding_rates=funding_rates,
+        )
+
     def _fetch_store_candles(self, symbol: str, timeframe: str):
+        cache_key = (symbol, timeframe)
+        if cache_key in self._cycle_candle_cache:
+            return self._cycle_candle_cache[cache_key]
+
         rows = self.client.get_candles(symbol, timeframe, self.candle_limit)
         candles = normalize_candles(symbol, timeframe, rows)
-        return [
+        stored = [
             self.storage.upsert_candle(
                 symbol=candle.symbol,
                 timeframe=candle.timeframe,
@@ -134,6 +162,17 @@ class Runner:
             )
             for candle in candles
         ]
+        self._cycle_candle_cache[cache_key] = stored
+        return stored
+
+    def _fetch_funding_rate(self, symbol: str) -> float | None:
+        get_funding_rate = getattr(self.client, "get_funding_rate", None)
+        if not callable(get_funding_rate):
+            return None
+        try:
+            return get_funding_rate(symbol)
+        except Exception:
+            return None
 
     def _resolve_risk_state(self) -> RiskState:
         """Resolve the RiskState to pass into the RiskGuard.

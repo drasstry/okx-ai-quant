@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 import pandas as pd
@@ -13,6 +13,7 @@ AVAILABLE_STRATEGIES = (
     "ema-momentum",
     "multi-timeframe-trend",
     "volatility-adjusted-momentum",
+    "cross-sectional-momentum-funding",
 )
 
 
@@ -22,6 +23,7 @@ class StrategySignal(Signal):
     entry_price: float | None = None
     stop_price: float | None = None
     target_price: float | None = None
+    recommended_leverage: int | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -551,6 +553,215 @@ class VolatilityAdjustedMomentumStrategy:
         )
 
 
+@dataclass(frozen=True)
+class CrossSectionalScore:
+    symbol: str
+    direction: SignalDirection
+    rank: int
+    universe_size: int
+    momentum: float
+    realized_volatility: float
+    atr_rate: float
+    funding_rate: float
+    recommended_leverage: int
+
+
+@dataclass(kw_only=True)
+class CrossSectionalMomentumFundingStrategy:
+    """Rank the universe by medium-term momentum, then filter by funding and volatility."""
+
+    min_expected_move: float
+    momentum_lookback: int = 72
+    volatility_lookback: int = 24
+    selection_quantile: float = 0.20
+    min_universe_size: int = 5
+    atr_period: int = 14
+    max_long_funding_rate: float = 0.0008
+    max_short_funding_rate: float = 0.0008
+    target_hourly_volatility: float = 0.015
+    _scores: dict[str, CrossSectionalScore] = field(default_factory=dict, init=False)
+
+    def prepare_universe(
+        self,
+        *,
+        symbols: list[str],
+        one_hour: dict[str, list[Candle]],
+        four_hour: dict[str, list[Candle]],
+        funding_rates: dict[str, float] | None = None,
+    ) -> None:
+        del four_hour
+        funding_rates = funding_rates or {}
+        metrics: list[tuple[str, float, float, float, float]] = []
+        required = max(self.momentum_lookback + 1, self.volatility_lookback + 1, self.atr_period)
+        for symbol in symbols:
+            candles = one_hour.get(symbol, [])
+            if len(candles) < required:
+                continue
+            frame = _frame(candles)
+            close = frame["close"]
+            latest_close = float(close.iloc[-1])
+            lookback_close = float(close.iloc[-self.momentum_lookback - 1])
+            if latest_close <= 0 or lookback_close <= 0:
+                continue
+
+            returns = close.pct_change().dropna()
+            realized_volatility = float(
+                returns.tail(self.volatility_lookback).std(ddof=0)
+            )
+            latest_atr = atr(frame, self.atr_period).iloc[-1]
+            if pd.isna(latest_atr) or not pd.notna(realized_volatility):
+                continue
+
+            momentum = (latest_close / lookback_close) - 1.0
+            atr_rate = float(latest_atr / latest_close)
+            funding_rate = funding_rates.get(symbol, 0.0)
+            metrics.append(
+                (
+                    symbol,
+                    momentum,
+                    max(realized_volatility, 0.0001),
+                    max(atr_rate, 0.0001),
+                    funding_rate,
+                )
+            )
+
+        self._scores = {}
+        if len(metrics) < self.min_universe_size:
+            return
+
+        ranked = sorted(metrics, key=lambda row: row[1], reverse=True)
+        tail_count = max(1, int(len(ranked) * self.selection_quantile))
+        tail_count = min(tail_count, len(ranked) // 2)
+        long_symbols = {symbol for symbol, *_ in ranked[:tail_count]}
+        short_symbols = {symbol for symbol, *_ in ranked[-tail_count:]}
+        bottom_ranks = {
+            symbol: index + 1
+            for index, (symbol, *_rest) in enumerate(reversed(ranked[-tail_count:]))
+        }
+
+        for rank, (symbol, momentum, realized_volatility, atr_rate, funding_rate) in enumerate(
+            ranked,
+            start=1,
+        ):
+            direction = SignalDirection.HOLD
+            display_rank = rank
+            if symbol in long_symbols:
+                direction = SignalDirection.LONG
+            elif symbol in short_symbols:
+                direction = SignalDirection.SHORT
+                display_rank = bottom_ranks[symbol]
+            else:
+                continue
+
+            recommended_leverage = max(
+                1,
+                int(self.target_hourly_volatility / realized_volatility),
+            )
+            self._scores[symbol] = CrossSectionalScore(
+                symbol=symbol,
+                direction=direction,
+                rank=display_rank,
+                universe_size=len(ranked),
+                momentum=momentum,
+                realized_volatility=realized_volatility,
+                atr_rate=atr_rate,
+                funding_rate=funding_rate,
+                recommended_leverage=recommended_leverage,
+            )
+
+    def generate(
+        self,
+        symbol: str,
+        one_hour: list[Candle],
+        four_hour: list[Candle],
+    ) -> Signal:
+        del four_hour
+        score = self._scores.get(symbol)
+        if score is None:
+            return _hold(
+                symbol,
+                "Symbol is not in the selected cross-sectional momentum tails.",
+            )
+
+        expected_move = abs(score.momentum)
+        if expected_move < self.min_expected_move:
+            return _hold(
+                symbol,
+                f"Cross-sectional momentum {expected_move:.4f} is below minimum "
+                f"{self.min_expected_move:.4f}.",
+                expected_move=expected_move,
+            )
+
+        if (
+            score.direction == SignalDirection.LONG
+            and score.funding_rate > self.max_long_funding_rate
+        ):
+            return _hold(
+                symbol,
+                f"Long funding filter blocked entry: funding {score.funding_rate:.5f} "
+                f"> {self.max_long_funding_rate:.5f}.",
+                expected_move=expected_move,
+            )
+
+        if (
+            score.direction == SignalDirection.SHORT
+            and score.funding_rate < -self.max_short_funding_rate
+        ):
+            return _hold(
+                symbol,
+                f"Short funding filter blocked entry: funding {score.funding_rate:.5f} "
+                f"< {-self.max_short_funding_rate:.5f}.",
+                expected_move=expected_move,
+            )
+
+        if not one_hour:
+            return _hold(symbol, "No recent candle is available for entry price.")
+
+        latest_close = float(one_hour[-1].close)
+        if latest_close <= 0:
+            return _hold(symbol, "Latest close is not positive.")
+
+        stop_rate = max(score.atr_rate, score.realized_volatility * 2.0, self.min_expected_move)
+        target_rate = max(stop_rate * 1.6, expected_move * 0.5)
+        percentile_strength = 1.0 - ((score.rank - 1) / max(1, score.universe_size - 1))
+        confidence = _bounded_confidence(
+            0.58 + (0.22 * percentile_strength) + min(expected_move, 0.12)
+        )
+        reason = (
+            "Cross-sectional momentum with funding filter: "
+            f"rank={score.rank}/{score.universe_size}, "
+            f"momentum={score.momentum:.4f}, "
+            f"funding={score.funding_rate:.5f}, "
+            f"hourly_vol={score.realized_volatility:.4f}, "
+            f"recommended_leverage={score.recommended_leverage}x."
+        )
+
+        if score.direction == SignalDirection.LONG:
+            return _signal(
+                symbol=symbol,
+                direction=SignalDirection.LONG,
+                confidence=confidence,
+                reason=reason,
+                expected_move=expected_move,
+                entry_price=latest_close,
+                stop_price=latest_close * (1.0 - stop_rate),
+                target_price=latest_close * (1.0 + target_rate),
+                recommended_leverage=score.recommended_leverage,
+            )
+
+        return _signal(
+            symbol=symbol,
+            direction=SignalDirection.SHORT,
+            confidence=confidence,
+            reason=reason,
+            expected_move=expected_move,
+            entry_price=latest_close,
+            stop_price=latest_close * (1.0 + stop_rate),
+            target_price=latest_close * (1.0 - target_rate),
+            recommended_leverage=score.recommended_leverage,
+        )
+
+
 def create_strategy(name: str, *, min_expected_move: float):
     match name:
         case "ema-rsi-atr":
@@ -565,6 +776,8 @@ def create_strategy(name: str, *, min_expected_move: float):
             return MultiTimeframeTrendStrategy(min_expected_move=min_expected_move)
         case "volatility-adjusted-momentum":
             return VolatilityAdjustedMomentumStrategy(min_expected_move=min_expected_move)
+        case "cross-sectional-momentum-funding":
+            return CrossSectionalMomentumFundingStrategy(min_expected_move=min_expected_move)
         case _:
             choices = ", ".join(AVAILABLE_STRATEGIES)
             raise ValueError(f"Unknown strategy {name!r}. Choose one of: {choices}")
@@ -590,6 +803,7 @@ def _signal(
     entry_price: float,
     stop_price: float,
     target_price: float,
+    recommended_leverage: int | None = None,
 ) -> StrategySignal:
     return StrategySignal(
         symbol=symbol,
@@ -602,6 +816,7 @@ def _signal(
         entry_price=entry_price,
         stop_price=stop_price,
         target_price=target_price,
+        recommended_leverage=recommended_leverage,
     )
 
 

@@ -1,4 +1,5 @@
 import math
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import pytest
@@ -7,12 +8,22 @@ from okx_ai_quant.models import RiskStatus, Signal, SignalDirection
 from okx_ai_quant.risk import RiskGuard, RiskState
 
 
+@dataclass(frozen=True, kw_only=True)
+class SignalWithLeverage(Signal):
+    recommended_leverage: int | None = None
+
+
 def _signal(
     *,
     symbol: str = "BTC-USDT-SWAP",
     direction: SignalDirection = SignalDirection.LONG,
+    recommended_leverage: int | None = None,
 ) -> Signal:
-    return Signal(
+    signal_class = SignalWithLeverage if recommended_leverage is not None else Signal
+    kwargs = {}
+    if recommended_leverage is not None:
+        kwargs["recommended_leverage"] = recommended_leverage
+    return signal_class(
         symbol=symbol,
         timeframe="1H",
         direction=direction,
@@ -20,6 +31,7 @@ def _signal(
         reason="Test signal.",
         created_at=datetime(2026, 4, 29, 8, 0, tzinfo=UTC),
         id=42,
+        **kwargs,
     )
 
 
@@ -55,6 +67,32 @@ def test_approves_valid_long_signal_with_position_size_and_leverage():
     assert decision.position_size_usdt == 100.0
     assert decision.leverage == 3
     assert decision.signal_id == 42
+
+
+def test_uses_strategy_recommended_leverage_when_below_env_cap():
+    guard = RiskGuard(
+        symbols={"BTC-USDT-SWAP"},
+        reference_capital_usdt=1000.0,
+        leverage=5,
+    )
+
+    decision = guard.evaluate(_signal(recommended_leverage=2), RiskState())
+
+    assert decision.status == RiskStatus.APPROVED
+    assert decision.leverage == 2
+
+
+def test_caps_strategy_recommended_leverage_at_env_max():
+    guard = RiskGuard(
+        symbols={"BTC-USDT-SWAP"},
+        reference_capital_usdt=1000.0,
+        leverage=5,
+    )
+
+    decision = guard.evaluate(_signal(recommended_leverage=10), RiskState())
+
+    assert decision.status == RiskStatus.APPROVED
+    assert decision.leverage == 5
 
 
 def test_approved_position_size_shrinks_with_stricter_max_risk_per_trade():

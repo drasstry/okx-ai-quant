@@ -83,16 +83,18 @@ class TradingBot:
         if self.settings.MANAGE_EXISTING_POSITIONS:
             self.monitor_positions()
 
+        tradable_symbols = self._tradable_symbols()
         self._entry_block_reason = self._okx_entry_health_block_reason()
         if self._entry_block_reason:
             self._notify(f"Blocking new entries this cycle: {self._entry_block_reason}")
             return [
                 BotCycleResult(symbol=symbol, result=None, skipped_reason=self._entry_block_reason)
-                for symbol in (self._tradable_symbols_cache or self.settings.symbols)
+                for symbol in tradable_symbols
             ]
 
+        self.runner.prepare_universe(tradable_symbols)
         results: list[BotCycleResult] = []
-        for symbol in self._tradable_symbols():
+        for symbol in tradable_symbols:
             try:
                 results.append(self._process_symbol(symbol))
             except Exception as exc:  # noqa: BLE001 - bot loop must isolate symbols.
@@ -552,7 +554,7 @@ class TradingBot:
         )
 
     def _enforce_position_leverage(self, position: PositionRecord) -> None:
-        if position.leverage == self.settings.MAX_LEVERAGE:
+        if position.leverage is None or position.leverage <= self.settings.MAX_LEVERAGE:
             return
         margin_mode = position.margin_mode
         if not margin_mode:
@@ -570,7 +572,7 @@ class TradingBot:
                 margin_mode=margin_mode,
             )
             self._notify(
-                f"Updated OKX leverage: {position.symbol} {margin_mode} "
+                f"Reduced OKX leverage above cap: {position.symbol} {margin_mode} "
                 f"{position.leverage or '-'}x -> {self.settings.MAX_LEVERAGE}x."
             )
         except Exception as exc:  # noqa: BLE001 - leverage correction should not stop exits.

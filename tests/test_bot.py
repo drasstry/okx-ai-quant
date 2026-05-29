@@ -9,6 +9,7 @@ from okx_ai_quant.models import (
     ExitReason,
     OrderRecord,
     OrderState,
+    PositionRecord,
     PositionState,
     RiskStatus,
     Signal,
@@ -230,6 +231,58 @@ def test_bot_submit_mode_places_order_after_dry_run(tmp_path):
     assert client.connectivity_checks == [
         {"attempts": 5, "required_successes": 5, "symbol": "BTC-USDT-SWAP"}
     ]
+
+
+def test_bot_reduces_exchange_leverage_when_above_env_cap(tmp_path):
+    bot, client = _bot(tmp_path, enable_trading=True)
+    position = PositionRecord(
+        symbol="BTC-USDT-SWAP",
+        side=SignalDirection.SHORT,
+        quantity=-0.5,
+        average_entry=100.0,
+        state=PositionState.OPEN,
+        opened_at=datetime(2026, 5, 7, 8, 0, tzinfo=UTC),
+        updated_at=datetime(2026, 5, 7, 8, 0, tzinfo=UTC),
+        margin_mode="cross",
+        leverage=3,
+    )
+
+    bot._enforce_position_leverage(position)
+
+    assert client.leverage_calls == [
+        {
+            "symbol": "BTC-USDT-SWAP",
+            "leverage": 1,
+            "margin_mode": "cross",
+            "position_side": None,
+        }
+    ]
+
+
+def test_bot_does_not_raise_position_leverage_to_env_cap(tmp_path):
+    bot, client = _bot(tmp_path, enable_trading=True)
+    bot.settings = Settings(
+        _env_file=None,
+        ENABLE_TRADING=True,
+        SYMBOLS="BTC-USDT-SWAP",
+        DB_PATH=tmp_path / "bot.sqlite3",
+        MAX_LEVERAGE=5,
+    )
+    position = PositionRecord(
+        symbol="BTC-USDT-SWAP",
+        side=SignalDirection.LONG,
+        quantity=0.5,
+        average_entry=100.0,
+        state=PositionState.OPEN,
+        opened_at=datetime(2026, 5, 7, 8, 0, tzinfo=UTC),
+        updated_at=datetime(2026, 5, 7, 8, 0, tzinfo=UTC),
+        margin_mode="cross",
+        leverage=2,
+    )
+
+    bot._enforce_position_leverage(position)
+
+    assert client.leverage_calls == []
 
 
 def test_bot_blocks_new_entries_when_okx_connectivity_is_unhealthy(tmp_path):

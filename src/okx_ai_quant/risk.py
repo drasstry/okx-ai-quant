@@ -76,12 +76,13 @@ class RiskGuard:
             return self._reject(signal, "Maximum open position limit reached.")
 
         position_size_usdt, reason = self._position_size(signal)
+        leverage = self._leverage_for_signal(signal)
         return RiskDecision(
             signal_id=signal.id,
             status=RiskStatus.APPROVED,
             reason=reason,
             position_size_usdt=position_size_usdt,
-            leverage=self.leverage,
+            leverage=leverage,
             created_at=datetime.now(UTC),
         )
 
@@ -135,6 +136,19 @@ class RiskGuard:
             status=RiskStatus.REJECTED,
             reason=reason,
             position_size_usdt=0.0,
-            leverage=self.leverage,
+            leverage=self._leverage_for_signal(signal),
             created_at=datetime.now(UTC),
         )
+
+    def _leverage_for_signal(self, signal: Signal) -> int:
+        recommended = getattr(signal, "recommended_leverage", None)
+        if recommended is None:
+            return self.leverage
+        if (
+            isinstance(recommended, bool)
+            or not isinstance(recommended, int)
+            or not isfinite(recommended)
+            or recommended < 1
+        ):
+            return self.leverage
+        return min(self.leverage, recommended)

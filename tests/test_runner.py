@@ -31,6 +31,11 @@ class FakeClient:
         self.settings = None
         self.leverage_calls = []
         self.instrument_calls = []
+        self.funding_calls = []
+        self.funding_rates = {
+            "BTC-USDT-SWAP": 0.0001,
+            "ETH-USDT-SWAP": -0.0001,
+        }
         self.instruments = [
             {
                 "instId": "BTC-USDT-SWAP",
@@ -66,6 +71,10 @@ class FakeClient:
 
     def get_ticker(self, symbol):
         return self.tickers[symbol]
+
+    def get_funding_rate(self, symbol):
+        self.funding_calls.append(symbol)
+        return self.funding_rates[symbol]
 
     def set_leverage(self, symbol, *, leverage, margin_mode, position_side=None):
         self.leverage_calls.append(
@@ -146,6 +155,22 @@ class FakeStrategy:
             confidence=0.8 if self.direction != SignalDirection.HOLD else 0.0,
             reason="Strategy fixture.",
             created_at=datetime(2026, 5, 6, 8, 2, tzinfo=UTC),
+        )
+
+
+class FakeUniverseStrategy(FakeStrategy):
+    def __init__(self):
+        super().__init__(SignalDirection.HOLD)
+        self.universe_calls = []
+
+    def prepare_universe(self, *, symbols, one_hour, four_hour, funding_rates):
+        self.universe_calls.append(
+            {
+                "symbols": symbols,
+                "one_hour": one_hour,
+                "four_hour": four_hour,
+                "funding_rates": funding_rates,
+            }
         )
 
 
@@ -521,3 +546,34 @@ def test_runner_records_analysis_but_does_not_submit_rejected_order():
     assert client.trade_api.calls == []
     assert storage.orders == []
     assert result.order is None
+
+
+def test_runner_prepares_universe_and_reuses_cycle_candle_cache():
+    client = FakeClient()
+    storage = FakeStorage()
+    strategy = FakeUniverseStrategy()
+    runner = Runner(
+        client=client,
+        storage=storage,
+        strategy=strategy,
+        risk_guard=FakeRiskGuard(RiskStatus.REJECTED),
+        execution_engine=ExecutionEngine(client),
+        risk_state=RiskState(open_positions=0),
+        candle_limit=2,
+    )
+
+    runner.prepare_universe(["BTC-USDT-SWAP", "ETH-USDT-SWAP"])
+    runner.run_once("BTC-USDT-SWAP")
+
+    assert client.candle_calls == [
+        ("BTC-USDT-SWAP", "1H", 2),
+        ("BTC-USDT-SWAP", "4H", 2),
+        ("ETH-USDT-SWAP", "1H", 2),
+        ("ETH-USDT-SWAP", "4H", 2),
+    ]
+    assert client.funding_calls == ["BTC-USDT-SWAP", "ETH-USDT-SWAP"]
+    assert strategy.universe_calls[0]["symbols"] == ["BTC-USDT-SWAP", "ETH-USDT-SWAP"]
+    assert strategy.universe_calls[0]["funding_rates"] == {
+        "BTC-USDT-SWAP": 0.0001,
+        "ETH-USDT-SWAP": -0.0001,
+    }

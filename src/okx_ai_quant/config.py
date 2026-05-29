@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
-from pydantic import AliasChoices, Field, field_validator, model_validator
+from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -130,13 +130,6 @@ class Settings(BaseSettings):
     FEE_RATE_PER_SIDE: float = Field(default=0.001, ge=0)
     SLIPPAGE_RATE: float = Field(default=0.001, ge=0)
     MIN_EXPECTED_MOVE: float = Field(default=0.006, gt=0)
-
-    @field_validator("MAX_LEVERAGE")
-    @classmethod
-    def max_leverage_must_not_exceed_two(cls, value: int) -> int:
-        if value > 2:
-            raise ValueError("MAX_LEVERAGE must be <= 2")
-        return value
 
     @model_validator(mode="after")
     def require_explicit_live_trading_opt_in(self) -> "Settings":

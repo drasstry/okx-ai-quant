@@ -35,9 +35,9 @@ OKX AI Quant 选择中间路线：
 
 ## 核心能力
 
-- 拉取 OKX ticker、`1H` 和 `4H` K 线
+- 拉取 OKX ticker、资金费率、`1H` 和 `4H` K 线
 - 支持多币种 USDT 永续合约扫描
-- 内置 6 个策略：趋势、动量、突破、均值回归
+- 内置 7 个策略：趋势、动量、突破、均值回归、横截面动量
 - 估算手续费、滑点和最小预期波动
 - 风控限制：单笔风险、日亏损、连续亏损、最大持仓数、最大杠杆
 - 使用 OKX 合约元数据计算订单张数，避免把 USDT 名义金额误当作 `sz`
@@ -103,6 +103,7 @@ src/okx_ai_quant/
 | `ema-momentum` | 动量 | EMA 方向与近期价格动量一致 |
 | `multi-timeframe-trend` | 多周期趋势 | `4H` 和 `1H` EMA stack 同向 |
 | `volatility-adjusted-momentum` | 波动过滤动量 | 动量必须超过 ATR 噪声 |
+| `cross-sectional-momentum-funding` | 横截面动量 | 对币种池按动量排序，交易最强/最弱尾部，用 funding 过滤拥挤方向，并在波动率升高时降低建议杠杆 |
 
 每个策略只输出三类信号：`LONG`、`SHORT`、`HOLD`。<br>
 即使策略给出 `LONG` 或 `SHORT`，订单也必须通过风控后才会进入执行层。
@@ -145,7 +146,7 @@ OKX_DEMO_API_SECRET=your_demo_api_secret
 OKX_DEMO_API_PASSPHRASE=your_demo_api_passphrase
 
 ENABLE_TRADING=false
-STRATEGY_NAME=ema-rsi-atr
+STRATEGY_NAME=cross-sectional-momentum-funding
 SYMBOLS=BTC-USDT-SWAP,ETH-USDT-SWAP,SOL-USDT-SWAP
 
 REFERENCE_CAPITAL_USDT=1000
@@ -275,11 +276,15 @@ OKX_LIVE_API_PASSPHRASE=your_live_passphrase
 | `MAX_DAILY_LOSS` | `0.02` | 日内最大亏损比例 |
 | `MAX_CONSECUTIVE_LOSSES` | `3` | 连续亏损后限制新开仓 |
 | `MAX_OPEN_POSITIONS` | `5` | 最大同时持仓数 |
-| `MAX_LEVERAGE` | `1` | 最大杠杆，代码层限制不超过 `2x` |
+| `MAX_LEVERAGE` | `1` | 最大杠杆上限，风控和 OKX 杠杆设置都会使用 |
 | `MARGIN_MODE` | `cross` | OKX 保证金模式：`cross` 或 `isolated` |
 | `OKX_ENTRY_HEALTHCHECK_*` | `5/5` | 新开仓前 OKX 行情连通性检查 |
 
 风控限制新开仓，不应阻止已有仓位的止损、止盈和 reduce-only 平仓。
+
+没有建议杠杆的策略会直接使用 `MAX_LEVERAGE`。`cross-sectional-momentum-funding`
+会按近期实现波动率给出建议杠杆：波动越低，允许的建议杠杆越高；波动升高时回落到接近
+`1x`；最终仍由 `MAX_LEVERAGE` 做硬上限，并在下单前写入 OKX。
 
 ### Telegram 和 LLM
 
