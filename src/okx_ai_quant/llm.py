@@ -75,12 +75,12 @@ class OpenAICompatibleLLMClient:
         client = OpenAI(base_url=self.base_url, api_key=self.api_key)
         prompt = (
             "你是谨慎的加密货币量化交易风控助手。"
-            "请基于下面的系统交易快照，生成一份适合 Telegram 推送的中文交易概览。"
-            "必须覆盖：现有持仓、估算盈亏、今日交易结果、主要风险点、"
-            "最近失败日志原因复盘、可能影响交易执行的稳定性问题、下一步观察重点。"
-            "如果日志里有 OKX API、SSL、timeout、Telegram 或订单失败，要明确点名。"
-            "不要逐笔复述所有交易，不要给投资建议，不要承诺收益。"
-            "控制在 500 字以内。Return strict JSON with key summary.\n\n"
+            "报告正文已经列出了账户数字、持仓和平仓明细，不要复述这些数字。"
+            "请基于下面的系统交易快照，用不超过 3 句话、120 字以内给出点评，"
+            "只讲最重要的内容：1) 今日盈亏的主要来源或原因；"
+            "2) 当前最大的一个风险（若有失败日志或稳定性问题且影响交易，点名它）；"
+            "3) 下一步最值得观察的一件事。"
+            "不要给投资建议，不要承诺收益。Return strict JSON with key summary.\n\n"
             f"Context: {json.dumps(_json_ready(context), ensure_ascii=False, sort_keys=True)}\n"
             f"Deterministic fallback: {fallback_chinese}"
         )

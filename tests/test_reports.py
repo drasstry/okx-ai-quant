@@ -81,9 +81,16 @@ def test_render_trade_overview_is_compact_and_includes_llm_summary():
         llm_summary="大模型摘要：当前风险可控。",
     )
 
-    assert "# OKX 交易概览 - 2026-05-06 08:00" in report
+    assert "OKX 交易日报 2026-05-06 08:00" in report
+    # Telegram plain text: no Markdown headers.
+    assert "#" not in report.replace("SWAP", "")
+    # Key numbers lead the report, before any detail sections.
+    assert report.index("权益 1000.00") < report.index("BTC-USDT-SWAP")
+    assert "今日已实现盈亏 -4.00" in report
     assert "大模型摘要：当前风险可控。" in report
     assert "BTC-USDT-SWAP LONG" in report
     assert "当前持仓接近止损" in report
     assert "失败日志复盘" in report
     assert "OKX 持仓同步失败" in report
+    # LLM comment comes last so numbers stay on top.
+    assert report.index("AI 点评") > report.index("风险点")

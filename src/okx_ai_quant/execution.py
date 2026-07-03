@@ -31,6 +31,8 @@ class ExecutionDecision:
     position_size_usdt: float
     leverage: int
     created_at: datetime
+    stop_loss: float | None = None
+    take_profit: float | None = None
     id: int | None = None
 
 
@@ -71,14 +73,18 @@ class ExecutionEngine:
         order_size = self._order_sizer(decision)
         self._ensure_exchange_leverage(decision)
         client_order_id = f"okxai{uuid4().hex[:20]}"
-        response = self._place_order_with_retries(
-            instId=decision.symbol,
-            tdMode=self.margin_mode,
-            side=side,
-            ordType="market",
-            sz=order_size,
-            clOrdId=client_order_id,
-        )
+        params = {
+            "instId": decision.symbol,
+            "tdMode": self.margin_mode,
+            "side": side,
+            "ordType": "market",
+            "sz": order_size,
+            "clOrdId": client_order_id,
+        }
+        attached_algo = _attached_stop_orders(decision)
+        if attached_algo:
+            params["attachAlgoOrds"] = attached_algo
+        response = self._place_order_with_retries(**params)
         order_id = None
         data = response.get("data")
         if isinstance(data, list) and data and isinstance(data[0], dict):
@@ -310,6 +316,25 @@ class InstrumentAwareOrderSizer:
             return (bid + ask) / Decimal("2")
 
         raise RuntimeError(f"Could not resolve a positive ticker price for {symbol}")
+
+
+def _attached_stop_orders(decision: ExecutableRiskDecision) -> list[dict[str, str]]:
+    """Build OKX ``attachAlgoOrds`` so SL/TP live on the exchange.
+
+    Without this the stop only exists in the local bot loop: it fires with up
+    to one poll interval of delay and not at all when the bot process is down.
+    ``-1`` order prices request market execution on trigger.
+    """
+    stop_loss = getattr(decision, "stop_loss", None)
+    take_profit = getattr(decision, "take_profit", None)
+    algo: dict[str, str] = {}
+    if stop_loss is not None and isfinite(stop_loss) and stop_loss > 0:
+        algo["slTriggerPx"] = f"{stop_loss:.10g}"
+        algo["slOrdPx"] = "-1"
+    if take_profit is not None and isfinite(take_profit) and take_profit > 0:
+        algo["tpTriggerPx"] = f"{take_profit:.10g}"
+        algo["tpOrdPx"] = "-1"
+    return [algo] if algo else []
 
 
 def to_okx_order_size(decision: ExecutableRiskDecision) -> str:

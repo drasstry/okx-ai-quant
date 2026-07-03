@@ -548,6 +548,30 @@ def test_runner_records_analysis_but_does_not_submit_rejected_order():
     assert result.order is None
 
 
+def test_prepare_universe_resets_candle_cache_for_plain_strategies():
+    client = FakeClient()
+    storage = FakeStorage()
+    runner = Runner(
+        client=client,
+        storage=storage,
+        strategy=FakeStrategy(SignalDirection.HOLD),
+        risk_guard=FakeRiskGuard(RiskStatus.REJECTED),
+        execution_engine=ExecutionEngine(client),
+        risk_state=RiskState(open_positions=0),
+        candle_limit=2,
+    )
+
+    # Two bot cycles: each one calls prepare_universe then run_once.
+    runner.prepare_universe(["BTC-USDT-SWAP"])
+    runner.run_once("BTC-USDT-SWAP")
+    runner.prepare_universe(["BTC-USDT-SWAP"])
+    runner.run_once("BTC-USDT-SWAP")
+
+    # The second cycle must fetch fresh candles instead of reusing cycle one.
+    assert client.candle_calls.count(("BTC-USDT-SWAP", "1H", 2)) == 2
+    assert client.candle_calls.count(("BTC-USDT-SWAP", "4H", 2)) == 2
+
+
 def test_runner_prepares_universe_and_reuses_cycle_candle_cache():
     client = FakeClient()
     storage = FakeStorage()

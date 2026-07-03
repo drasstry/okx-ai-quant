@@ -61,3 +61,22 @@ def test_telegram_notifier_can_use_explicit_proxy(monkeypatch):
 
     assert captured["url"] == "https://api.telegram.org/bottoken/sendMessage"
     assert captured["timeout"] == 20
+
+
+def test_split_message_keeps_short_messages_intact():
+    from okx_ai_quant.notifier import _split_message
+
+    assert _split_message("hello") == ["hello"]
+
+
+def test_split_message_splits_on_line_boundaries():
+    from okx_ai_quant.notifier import _split_message
+
+    lines = [f"line-{index:04d} " + "x" * 90 for index in range(60)]
+    message = "\n".join(lines)
+    chunks = _split_message(message, limit=1000)
+
+    assert len(chunks) > 1
+    assert all(len(chunk) <= 1000 for chunk in chunks)
+    # No content lost: every line survives in order.
+    assert "\n".join(chunks).split("\n") == lines

@@ -105,6 +105,8 @@ class Runner:
                     position_size_usdt=decision.position_size_usdt,
                     leverage=decision.leverage,
                     created_at=decision.created_at,
+                    stop_loss=getattr(signal, "stop_price", None),
+                    take_profit=getattr(signal, "target_price", None),
                     id=decision.id,
                 )
             )
@@ -120,11 +122,13 @@ class Runner:
         )
 
     def prepare_universe(self, symbols: list[str]) -> None:
+        # Every bot cycle must start from fresh candles; without this reset
+        # strategies keep seeing the first cycle's data forever.
+        self._cycle_candle_cache = {}
         prepare = getattr(self.strategy, "prepare_universe", None)
         if not callable(prepare):
             return
 
-        self._cycle_candle_cache = {}
         one_hour: dict[str, list] = {}
         four_hour: dict[str, list] = {}
         funding_rates: dict[str, float] = {}
@@ -193,7 +197,11 @@ class Runner:
 
         loader = getattr(self.storage, "load_risk_state", None)
         if callable(loader):
-            loaded = loader()
+            reference_capital = getattr(self.risk_guard, "reference_capital_usdt", None)
+            try:
+                loaded = loader(reference_capital_usdt=reference_capital)
+            except TypeError:
+                loaded = loader()
             if isinstance(loaded, RiskState):
                 return loaded
 

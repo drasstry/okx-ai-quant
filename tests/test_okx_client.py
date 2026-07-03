@@ -292,6 +292,18 @@ def test_normalize_candles_returns_oldest_first_with_close_and_time():
     assert candles[0].timeframe == "1m"
 
 
+def test_normalize_candles_drops_unconfirmed_okx_rows():
+    rows = [
+        # Full OKX row shape: [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]
+        ["1714550460000", "101", "105", "100", "104.5", "12.5", "1", "1", "0"],
+        ["1714550400000", "100", "103", "99", "101.25", "10.5", "1", "1", "1"],
+    ]
+
+    candles = normalize_candles("BTC-USDT-SWAP", "1m", rows)
+
+    assert [candle.close for candle in candles] == [101.25]
+
+
 def test_normalize_ticker_maps_prices():
     ticker = normalize_ticker(
         {

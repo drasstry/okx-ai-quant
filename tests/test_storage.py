@@ -372,3 +372,36 @@ def test_load_risk_state_counts_open_positions_and_pending_orders(tmp_path):
         state = storage.load_risk_state()
 
         assert state.open_positions == 2
+
+
+def test_load_risk_state_computes_daily_loss_and_consecutive_losses(tmp_path):
+    from okx_ai_quant.models import ExitReason, PositionExitRecord
+
+    with SQLiteStorage(tmp_path / "quant.sqlite3") as storage:
+        storage.initialize()
+        now = datetime.now(UTC)
+        for index, pnl in enumerate((5.0, -30.0, -20.0)):
+            storage.insert_position_exit(
+                PositionExitRecord(
+                    position_id=None,
+                    symbol="BTC-USDT-SWAP",
+                    side=SignalDirection.LONG,
+                    reason=ExitReason.STOP_LOSS,
+                    entry_price=100.0,
+                    exit_price=100.0 + pnl,
+                    quantity=1.0,
+                    realized_pnl=pnl,
+                    opened_at=now - timedelta(hours=3 - index),
+                    closed_at=now - timedelta(minutes=3 - index),
+                    notes="test exit",
+                )
+            )
+
+        state = storage.load_risk_state(reference_capital_usdt=1000.0)
+
+        # Two most recent exits lost money; today's net PnL is -45 on 1000.
+        assert state.consecutive_losses == 2
+        assert state.daily_loss_rate == pytest.approx(0.045)
+
+        # Without reference capital the loss rate stays neutral.
+        assert storage.load_risk_state().daily_loss_rate == 0.0

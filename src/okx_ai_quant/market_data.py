@@ -21,8 +21,18 @@ def normalize_candles(symbol: str, timeframe: str, rows: Sequence[Sequence[str]]
             volume=float(row[5]),
         )
         for row in rows
+        if _is_confirmed(row)
     ]
     return sorted(candles, key=lambda candle: candle.timestamp)
+
+
+def _is_confirmed(row: Sequence[str]) -> bool:
+    # OKX candle rows carry a trailing confirm flag ("0" while the candle is
+    # still forming). Signals must only see completed candles, otherwise every
+    # strategy repaints intra-candle.
+    if len(row) < 9:
+        return True
+    return str(row[-1]) != "0"
 
 
 def _optional_float(value: str | None) -> float | None:

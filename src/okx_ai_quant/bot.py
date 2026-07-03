@@ -53,9 +53,12 @@ class TradingBot:
         )
         while True:
             started = time.time()
-            self.publish_runtime_status()
-            self.run_once()
-            self.maybe_send_daily_report()
+            try:
+                self.publish_runtime_status()
+                self.run_once()
+                self.maybe_send_daily_report()
+            except Exception as exc:  # noqa: BLE001 - a dead bot cannot manage stops; log and keep looping.
+                self._notify(f"Bot cycle failed, retrying next cycle: {exc}")
             elapsed = time.time() - started
             time.sleep(max(5, self.settings.POLL_INTERVAL_SECONDS - elapsed))
 
@@ -77,8 +80,8 @@ class TradingBot:
         try:
             self.sync_tracked_orders()
             self.sweep_stale_orders()
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - order sync must not block position management.
+            self._notify(f"Order sync failed this cycle: {exc}")
         self.reconcile_exchange_state()
         if self.settings.MANAGE_EXISTING_POSITIONS:
             self.monitor_positions()
@@ -92,7 +95,15 @@ class TradingBot:
                 for symbol in tradable_symbols
             ]
 
-        self.runner.prepare_universe(tradable_symbols)
+        try:
+            self.runner.prepare_universe(tradable_symbols)
+        except Exception as exc:  # noqa: BLE001 - a data hiccup must not kill the bot.
+            reason = f"Universe preparation failed: {exc}"
+            self._notify(reason)
+            return [
+                BotCycleResult(symbol=symbol, result=None, skipped_reason=reason)
+                for symbol in tradable_symbols
+            ]
         results: list[BotCycleResult] = []
         for symbol in tradable_symbols:
             try:
@@ -255,6 +266,8 @@ class TradingBot:
                 position_size_usdt=result.risk_decision.position_size_usdt,
                 leverage=result.risk_decision.leverage,
                 created_at=result.risk_decision.created_at,
+                stop_loss=getattr(result.signal, "stop_price", None),
+                take_profit=getattr(result.signal, "target_price", None),
                 id=result.risk_decision.id,
             )
         )
@@ -426,13 +439,26 @@ class TradingBot:
 
         for local in self.runner.storage.load_open_positions():
             if local.symbol in allowed_symbols and local.symbol not in seen_symbols:
-                self.runner.storage.close_position(
+                # The exchange already closed this position (for example an
+                # attached SL/TP fired). Recording the exit at entry price
+                # would book PnL=0 and blind the daily-loss breaker, so use
+                # the latest market price as the best available exit price.
+                exit_price = self._latest_market_price(local.symbol)
+                if exit_price <= 0:
+                    exit_price = local.average_entry
+                exit_record = self.runner.storage.close_position(
                     symbol=local.symbol,
                     reason=ExitReason.RISK_EXIT,
-                    exit_price=local.average_entry,
+                    exit_price=exit_price,
                     closed_at=now,
                     notes="Local position closed because OKX reported no matching open SWAP position.",
+                    pnl_multiplier=self._contract_pnl_multiplier(local.symbol, exit_price),
                 )
+                if exit_record is not None:
+                    self._notify(
+                        f"Position closed on exchange: {exit_record.symbol} "
+                        f"estimated PnL={exit_record.realized_pnl:.6g}."
+                    )
 
     def _record_filled_order(self, order: OrderRecord, data: dict[str, object]) -> None:
         fill_size = _float(data.get("accFillSz"))
@@ -959,13 +985,26 @@ def _map_okx_order_state(value: object) -> OrderState | None:
     return None
 
 
+_REPORT_SLOT_GRACE = timedelta(minutes=45)
+
+
 def _due_report_slots(now: datetime, report_times: list[str]) -> list[str]:
+    """Return slots due right now, within a grace window after their time.
+
+    The grace window keeps a freshly (re)started bot from blasting every
+    already-passed slot of the day in one go; a slot missed by more than the
+    grace period is skipped instead of delivered hours late.
+    """
     due_slots: list[str] = []
+    local_time = now.replace(tzinfo=None)
     for report_time in report_times:
         scheduled = _parse_report_time(report_time)
         if scheduled is None:
             continue
-        if now.timetz().replace(tzinfo=None) >= scheduled:
+        scheduled_at = local_time.replace(
+            hour=scheduled.hour, minute=scheduled.minute, second=0, microsecond=0
+        )
+        if scheduled_at <= local_time < scheduled_at + _REPORT_SLOT_GRACE:
             due_slots.append(f"{scheduled.hour:02d}:{scheduled.minute:02d}")
     return due_slots
 

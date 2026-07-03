@@ -766,13 +766,15 @@ class SQLiteStorage:
             for row in rows
         ]
 
-    def load_risk_state(self):
+    def load_risk_state(self, *, reference_capital_usdt: float | None = None):
         """Aggregate the current RiskState from persisted trading state.
 
         ``open_positions`` counts real tracked positions plus non-terminal
         orders, so a filled entry keeps blocking additional new entries until
-        that position is closed. ``consecutive_losses`` remains a lightweight
-        order-state proxy until exchange PnL reconciliation is available.
+        that position is closed. ``daily_loss_rate`` and
+        ``consecutive_losses`` come from realized position exits, so the
+        MAX_DAILY_LOSS / MAX_CONSECUTIVE_LOSSES breakers act on actual trading
+        PnL rather than order bookkeeping states.
         """
         from okx_ai_quant.risk import RiskState
 
@@ -792,23 +794,34 @@ class SQLiteStorage:
             pending_rows["n"] if pending_rows is not None else 0
         )
 
-        recent_rows = self.connection.execute(
+        recent_exits = self.connection.execute(
             """
-            SELECT state FROM orders
+            SELECT realized_pnl FROM position_exits
             ORDER BY id DESC
             LIMIT 20
             """
         ).fetchall()
         consecutive_losses = 0
-        for row in recent_rows:
-            state = row["state"]
-            if state == "FILLED":
+        for row in recent_exits:
+            if float(row["realized_pnl"]) >= 0:
                 break
-            if state in ("FAILED", "CANCELED"):
-                consecutive_losses += 1
+            consecutive_losses += 1
+
+        daily_loss_rate = 0.0
+        if reference_capital_usdt is not None and reference_capital_usdt > 0:
+            today = datetime.now(UTC).date().isoformat()
+            pnl_row = self.connection.execute(
+                """
+                SELECT COALESCE(SUM(realized_pnl), 0.0) AS pnl FROM position_exits
+                WHERE substr(closed_at, 1, 10) = ?
+                """,
+                (today,),
+            ).fetchone()
+            realized_today = float(pnl_row["pnl"] if pnl_row is not None else 0.0)
+            daily_loss_rate = max(0.0, -realized_today) / reference_capital_usdt
 
         return RiskState(
-            daily_loss_rate=0.0,
+            daily_loss_rate=daily_loss_rate,
             consecutive_losses=consecutive_losses,
             open_positions=open_positions,
         )

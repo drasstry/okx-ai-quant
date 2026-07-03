@@ -39,11 +39,15 @@ class TelegramNotifier(Notifier):
         if not self.bot_token or not self.chat_id:
             raise NotificationError("Telegram notifier requires TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
 
+        for chunk in _split_message(message):
+            self._send_chunk(chunk)
+
+    def _send_chunk(self, message: str) -> None:
         url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
         payload = urllib.parse.urlencode(
             {
                 "chat_id": self.chat_id,
-                "text": message[:3900],
+                "text": message,
                 "disable_web_page_preview": "true",
             }
         ).encode("utf-8")
@@ -120,6 +124,29 @@ class TelegramBotClient:
             chat_id=self.chat_id,
             proxy_url=self.proxy_url,
         ).send(message)
+
+
+def _split_message(message: str, limit: int = 3900) -> list[str]:
+    """Split a long message on line boundaries instead of silently truncating."""
+    if len(message) <= limit:
+        return [message]
+    chunks: list[str] = []
+    current = ""
+    for line in message.splitlines(keepends=True):
+        while len(line) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        if len(current) + len(line) > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current += line
+    if current:
+        chunks.append(current)
+    return [chunk for chunk in (chunk.strip("\n") for chunk in chunks) if chunk]
 
 
 def build_notifier(settings: Settings) -> Notifier:

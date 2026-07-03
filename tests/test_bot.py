@@ -9,6 +9,7 @@ from okx_ai_quant.models import (
     ExitReason,
     OrderRecord,
     OrderState,
+    PositionExitRecord,
     PositionRecord,
     PositionState,
     RiskStatus,
@@ -227,6 +228,10 @@ def test_bot_submit_mode_places_order_after_dry_run(tmp_path):
 
     assert results[0].submitted_order.order_id == "okx-order-1"
     assert client.trade_api.calls[0]["instId"] == "BTC-USDT-SWAP"
+    # SL/TP must be attached on the exchange, not just tracked locally.
+    assert client.trade_api.calls[0]["attachAlgoOrds"] == [
+        {"slTriggerPx": "99", "slOrdPx": "-1", "tpTriggerPx": "105", "tpOrdPx": "-1"}
+    ]
     assert bot.runner.storage.load_open_orders()[0].order_id == "okx-order-1"
     assert client.connectivity_checks == [
         {"attempts": 5, "required_successes": 5, "symbol": "BTC-USDT-SWAP"}
@@ -416,16 +421,19 @@ def test_bot_marks_local_position_closed_when_missing_on_exchange(tmp_path):
 def test_bot_still_submits_close_order_when_new_trade_loss_limit_is_reached(tmp_path):
     bot, client = _bot(tmp_path, enable_trading=True)
     for index in range(3):
-        bot.runner.storage.insert_order(
-            OrderRecord(
-                signal_id=None,
-                order_id=f"canceled-{index}",
-                client_order_id=f"okxai-canceled-{index}",
-                symbol="BTC-USDT-SWAP",
+        bot.runner.storage.insert_position_exit(
+            PositionExitRecord(
+                position_id=None,
+                symbol="ETH-USDT-SWAP",
                 side=SignalDirection.LONG,
+                reason=ExitReason.STOP_LOSS,
+                entry_price=110.0,
+                exit_price=100.0,
                 quantity=1.0,
-                state=OrderState.CANCELED,
-                created_at=datetime(2026, 5, 7, 7, index, tzinfo=UTC),
+                realized_pnl=-10.0,
+                opened_at=datetime(2026, 5, 7, 6, index, tzinfo=UTC),
+                closed_at=datetime(2026, 5, 7, 7, index, tzinfo=UTC),
+                notes="losing trade",
             )
         )
     assert bot.runner.storage.load_risk_state().consecutive_losses == 3
@@ -673,13 +681,17 @@ def test_telegram_notifier_suppresses_operational_noise_but_sends_reports(tmp_pa
 
     assert bot.send_daily_report(date(2026, 5, 7), force=True)
     assert len(fake_notifier.messages) == 1
-    assert "OKX 交易概览" in fake_notifier.messages[0]
+    assert "OKX 交易日报" in fake_notifier.messages[0]
 
 
-def test_due_report_slots_include_missed_times_without_future_times():
+def test_due_report_slots_only_fire_within_grace_window():
     now = datetime(2026, 5, 7, 8, 3, tzinfo=UTC)
 
-    assert _due_report_slots(now, ["00:00", "08:00", "12:00", "bad"]) == ["00:00", "08:00"]
+    # 00:00 was missed hours ago; a restart must not blast stale reports.
+    assert _due_report_slots(now, ["00:00", "08:00", "12:00", "bad"]) == ["08:00"]
+    assert _due_report_slots(
+        datetime(2026, 5, 7, 8, 50, tzinfo=UTC), ["08:00", "12:00"]
+    ) == []
 
 
 def test_scheduled_report_slot_does_not_conflict_with_manual_report(tmp_path):
