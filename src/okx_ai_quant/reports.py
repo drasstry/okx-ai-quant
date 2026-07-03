@@ -74,13 +74,23 @@ def render_trade_overview(
     strategy = context.get("strategy", "-")
     lines = [
         f"📊 OKX 交易日报 {report_date.isoformat()}{title_slot} | {mode} | {strategy}",
+    ]
+    halted = str(totals.get("halted") or "")
+    if halted:
+        lines.append(f"⛔ 已停机：{halted}（发送 /resume 恢复）")
+    lines.extend([
         "",
         f"权益 {account.get('equity_usdt', '-')} USDT（可用 {account.get('available_usdt', '-')}）",
+    ])
+    drawdown = str(totals.get("drawdown") or "")
+    if drawdown and drawdown != "-":
+        lines.append(f"回撤 {drawdown}")
+    lines.extend([
         f"今日已实现盈亏 {totals.get('realized_pnl_usdt', '0.00')} USDT | "
         f"持仓浮动盈亏 {totals.get('unrealized_pnl_usdt', '0.00')} USDT",
         f"持仓 {totals.get('open_position_count', 0)} 个 | 今日订单 成交 {orders.get('filled', 0)} / "
         f"撤销 {orders.get('canceled', 0)} / 未结 {orders.get('submitted', 0)}",
-    ]
+    ])
 
     lines.extend(["", "📈 当前持仓"])
     if open_positions:

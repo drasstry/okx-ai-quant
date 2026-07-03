@@ -270,6 +270,100 @@ def test_warmup_window_skips_trading_before_trade_start():
     assert result.equity_curve[0][0] >= T0 + timedelta(hours=4)
 
 
+def test_drawdown_halt_flattens_and_stops_trading_for_good():
+    # Entry at 100 with stop 80; price collapses to 85 (unrealized -15% on
+    # 100% notional... here notional is 10% so equity dips 1.5%); use a tight
+    # max_drawdown so the crash trips the kill switch while the position is open.
+    candles = [
+        _candle(0),
+        _candle(1, high=100.5, low=86.0, close=86.0),
+        _candle(2, close=86.0),
+        _candle(3, close=86.0),
+    ]
+    # Stop 20% away -> stop-distance sizing gives 50 notional (qty 0.5), so
+    # the crash to 86 dents equity by ~0.7%; a 0.5% limit must trip.
+    strategy = StubStrategy(fire_at={0, 2, 3}, stop=80.0, target=150.0)
+    engine = _engine(candles, strategy, max_drawdown=0.005)
+    result = engine.run()
+
+    assert result.halted_at is not None
+    trade = result.trades[0]
+    assert trade.exit_reason == "DRAWDOWN_HALT"
+    # No re-entry after the halt even though signals keep firing.
+    assert len(result.trades) == 1
+
+
+def test_exposure_net_cap_limits_book_in_backtest():
+    symbols = [f"C{i}-USDT-SWAP" for i in range(6)]
+    data = {}
+    for symbol in symbols:
+        data[symbol] = SymbolHistory(
+            one_hour=[_candle(index, symbol=symbol) for index in range(4)],
+            four_hour=[],
+            funding=[],
+        )
+
+    class MultiStub(StubStrategy):
+        def generate(self, symbol, one_hour, four_hour):
+            return StrategySignal(
+                symbol=symbol,
+                timeframe="1H",
+                direction=SignalDirection.LONG,
+                confidence=0.8,
+                reason="stub",
+                created_at=one_hour[-1].timestamp,
+                expected_move=0.05,
+                entry_price=100.0,
+                stop_price=95.0,
+                target_price=150.0,
+            )
+
+    config = BacktestConfig(
+        symbols=symbols,
+        initial_capital_usdt=1000.0,
+        fee_rate_per_side=0.0,
+        slippage_rate=0.0,
+        max_net_exposure_rate=0.25,
+        max_total_exposure_rate=1.0,
+    )
+    engine = BacktestEngine(
+        strategy_name="stub",
+        config=config,
+        data=data,
+        strategy=MultiStub(),
+    )
+    result = engine.run()
+
+    # Each position is 10% notional; the 25% net cap admits at most 2-3 longs,
+    # not the 5 allowed by max_open_positions.
+    open_now = [trade for trade in result.trades if trade.closed_at is None]
+    assert 0 < len(open_now) <= 3
+
+
+def test_equity_based_sizing_shrinks_after_losses():
+    candles = [
+        _candle(0),
+        _candle(1, low=94.0, close=99.0),  # stop-out: equity drops
+        _candle(2, close=99.0),
+        _candle(3, close=99.0),
+        _candle(4, close=99.0),
+    ]
+    strategy = StubStrategy(fire_at={0, 3}, stop=95.0, target=200.0)
+    # Loosen breakers so the second entry is allowed the same day.
+    engine = _engine(
+        candles,
+        strategy,
+        max_daily_loss=0.99,
+        max_consecutive_losses=10,
+    )
+    result = engine.run()
+
+    assert len(result.trades) == 2
+    first, second = result.trades
+    # Second entry is sized off the reduced equity, not initial capital.
+    assert second.notional_usdt < first.notional_usdt
+
+
 def test_report_renders_stats_and_curve():
     candles = [
         _candle(0),

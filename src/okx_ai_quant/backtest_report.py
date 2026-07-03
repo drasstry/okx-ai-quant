@@ -138,10 +138,14 @@ def _strategy_section(result: StrategyResult) -> str:
         if worst_rows
         else ""
     )
+    halted_at = stats.get("halted_at")
+    halted_text = (
+        f" ｜ ⛔ {halted_at.date().isoformat()} 触发回撤熔断后停止交易" if halted_at else ""
+    )
     return (
         f"<h2>{escape(result.strategy)}</h2>"
         f"<p class=\"meta\">平仓原因：{escape(reason_text)} ｜ 平均盈利 {stats['avg_win']:,.0f} ｜ "
-        f"平均亏损 {stats['avg_loss']:,.0f}</p>"
+        f"平均亏损 {stats['avg_loss']:,.0f}{halted_text}</p>"
         f"<div class=\"chart\">{_equity_svg(result)}</div>"
         f"<div class=\"chart\">{worst_table}</div>"
     )

@@ -272,14 +272,30 @@ OKX_LIVE_API_PASSPHRASE=your_live_passphrase
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `REFERENCE_CAPITAL_USDT` | `1000` | Reference capital for risk sizing |
+| `REFERENCE_CAPITAL_USDT` | `1000` | Fallback capital for risk sizing when live equity is unknown |
 | `MAX_RISK_PER_TRADE` | `0.01` | Maximum per-trade risk ratio |
-| `MAX_DAILY_LOSS` | `0.02` | Maximum daily loss ratio |
-| `MAX_CONSECUTIVE_LOSSES` | `3` | New-entry throttle after consecutive losses |
+| `MAX_DAILY_LOSS` | `0.02` | Maximum daily loss ratio (resets each UTC day) |
+| `MAX_CONSECUTIVE_LOSSES` | `3` | New-entry throttle after consecutive losing exits today |
 | `MAX_OPEN_POSITIONS` | `5` | Maximum simultaneous open positions |
+| `MAX_DRAWDOWN` | `0.10` | Kill switch: drawdown from the equity high-water mark that flattens everything and halts trading until `/resume` |
+| `MAX_TOTAL_EXPOSURE_RATE` | `0.40` | Cap on total open notional as a fraction of equity |
+| `MAX_NET_EXPOSURE_RATE` | `0.25` | Cap on net (long minus short) notional; correlated crypto positions behave like one bet |
+| `LOSS_STREAK_DAYS` | `2` | Consecutive losing days before risk is reduced |
+| `LOSS_STREAK_RISK_MULTIPLIER` | `0.5` | Risk budget multiplier applied during a losing streak |
 | `MAX_LEVERAGE` | `1` | Maximum leverage cap used by the risk guard and OKX leverage setup |
 | `MARGIN_MODE` | `cross` | OKX margin mode: `cross` or `isolated` |
 | `OKX_ENTRY_HEALTHCHECK_*` | `5/5` | OKX market-data connectivity check before entries |
+
+Position sizing uses **live USDT equity** (snapshotted every cycle into the
+`equity_snapshots` table); `REFERENCE_CAPITAL_USDT` is only the fallback when
+no balance has been observed yet. Risk shrinks automatically in a drawdown
+and compounds in a run-up.
+
+The drawdown kill switch is the hard capital-preservation guarantee: once
+equity falls `MAX_DRAWDOWN` below its high-water mark, all positions are
+flattened and new entries stop until a human sends `/resume` on Telegram
+(which re-bases the high-water mark to current equity — also do this after
+deposits or withdrawals). `/halt` stops new entries manually.
 
 Risk controls block new entries. They should not block reduce-only exits for existing positions.
 

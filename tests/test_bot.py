@@ -238,6 +238,48 @@ def test_bot_submit_mode_places_order_after_dry_run(tmp_path):
     ]
 
 
+def test_bot_drawdown_kill_switch_flattens_halts_and_resumes(tmp_path):
+    import pytest
+
+    bot, client = _bot(tmp_path, enable_trading=True)
+    # Pretend the account once had 2000 USDT; FakeClient reports 1000 now (-50%).
+    bot.runner.storage.set_state("portfolio:hwm", "2000", datetime.now(UTC))
+    bot.runner.storage.upsert_position(
+        symbol="BTC-USDT-SWAP",
+        side=SignalDirection.LONG,
+        quantity=0.5,
+        average_entry=110.0,
+        opened_at=datetime(2026, 5, 7, 8, 0, tzinfo=UTC),
+        updated_at=datetime(2026, 5, 7, 8, 0, tzinfo=UTC),
+    )
+    _set_exchange_position(client)
+
+    results = bot.run_once()
+
+    assert bot.is_halted() is not None
+    assert all("halted" in (item.skipped_reason or "").lower() for item in results)
+    # The open position was flattened with a reduce-only close order.
+    assert any(call.get("reduceOnly") == "true" for call in client.trade_api.calls)
+
+    equity = bot.resume()
+    assert bot.is_halted() is None
+    assert equity == pytest.approx(1000.0)
+    assert float(bot.runner.storage.get_state("portfolio:hwm")) == pytest.approx(1000.0)
+
+
+def test_bot_exposure_cap_blocks_new_entry(tmp_path):
+    bot, client = _bot(tmp_path, enable_trading=True)
+    bot.settings = bot.settings.model_copy(
+        update={"MAX_TOTAL_EXPOSURE_RATE": 0.0001, "MAX_NET_EXPOSURE_RATE": 0.0001}
+    )
+
+    results = bot.run_once()
+
+    assert results[0].skipped_reason is not None
+    assert "exposure" in results[0].skipped_reason.lower()
+    assert all("attachAlgoOrds" not in call for call in client.trade_api.calls)
+
+
 def test_bot_does_not_stack_entries_on_symbol_with_open_position(tmp_path):
     bot, client = _bot(tmp_path, enable_trading=True)
     bot.runner.storage.upsert_position(

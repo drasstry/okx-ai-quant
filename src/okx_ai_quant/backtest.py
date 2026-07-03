@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Iterable
 
 from okx_ai_quant.models import Candle, RiskStatus, SignalDirection
+from okx_ai_quant.portfolio import ExposureLimits, evaluate_drawdown, exposure_block_reason
 from okx_ai_quant.risk import RiskGuard, RiskState
 from okx_ai_quant.strategy import create_strategy
 
@@ -51,6 +52,11 @@ class BacktestConfig:
     min_expected_move: float = 0.006
     position_timeout_hours: int = 72
     exit_on_reverse_signal: bool = True
+    max_drawdown: float = 0.10
+    max_total_exposure_rate: float = 0.40
+    max_net_exposure_rate: float = 0.25
+    loss_streak_days: int = 2
+    loss_streak_risk_multiplier: float = 0.5
 
     def strategy_min_expected_move(self) -> float:
         # Mirrors cli.build_runner: max(MIN_EXPECTED_MOVE, round-trip cost).
@@ -96,6 +102,7 @@ class StrategyResult:
     trades: list[BacktestTrade]
     equity_curve: list[tuple[datetime, float]]
     initial_capital: float
+    halted_at: datetime | None = None
 
     @property
     def final_equity(self) -> float:
@@ -138,6 +145,7 @@ class StrategyResult:
             "total_fees": sum(trade.fees for trade in self.trades),
             "total_funding": sum(trade.funding for trade in self.trades),
             "exit_reasons": reasons,
+            "halted_at": self.halted_at,
         }
 
 
@@ -169,7 +177,15 @@ class BacktestEngine:
             max_consecutive_losses=config.max_consecutive_losses,
             max_positions=config.max_open_positions,
             leverage=1,
+            loss_streak_days=config.loss_streak_days,
+            loss_streak_risk_multiplier=config.loss_streak_risk_multiplier,
         )
+        self.exposure_limits = ExposureLimits(
+            max_total_rate=config.max_total_exposure_rate,
+            max_net_rate=config.max_net_exposure_rate,
+        )
+        self.high_water_mark = config.initial_capital_usdt
+        self.halted_at: datetime | None = None
 
         self.open_positions: dict[str, BacktestTrade] = {}
         self._closed_this_bar: set[str] = set()
@@ -211,6 +227,7 @@ class BacktestEngine:
             self._intrabar_exits(current, close_time)
             self._timeout_exits(current, close_time)
             self._daily_loss_flatten(current, close_time)
+            self._drawdown_check(current, close_time)
 
             signals = self._generate_signals(current, cursors, four_cursors, close_time)
             if self.config.exit_on_reverse_signal:
@@ -225,6 +242,7 @@ class BacktestEngine:
             trades=self.trades,
             equity_curve=self.equity_curve,
             initial_capital=self.config.initial_capital_usdt,
+            halted_at=self.halted_at,
         )
 
     # ------------------------------------------------------------- mechanics
@@ -294,6 +312,53 @@ class BacktestEngine:
                 at=close_time,
                 reason="RISK_EXIT",
             )
+
+    def _drawdown_check(self, current: dict[str, Candle], close_time: datetime) -> None:
+        """Mirror the live drawdown kill switch: flatten and halt for good.
+
+        The live bot requires a human /resume; within a backtest run that
+        means trading never restarts after the trip.
+        """
+        if self.halted_at is not None:
+            return
+        equity = self._current_equity(current)
+        status = evaluate_drawdown(
+            equity=equity,
+            high_water_mark=self.high_water_mark,
+            max_drawdown=self.config.max_drawdown,
+        )
+        self.high_water_mark = status.high_water_mark
+        if not status.tripped:
+            return
+        self.halted_at = close_time
+        for symbol in list(self.open_positions):
+            candle = current.get(symbol)
+            if candle is None:
+                continue
+            self._close(
+                self.open_positions[symbol],
+                price=candle.close,
+                at=close_time,
+                reason="DRAWDOWN_HALT",
+            )
+
+    def _current_equity(self, current: dict[str, Candle]) -> float:
+        unrealized = 0.0
+        for symbol, trade in self.open_positions.items():
+            mark = current[symbol].close if symbol in current else trade.entry_price
+            unrealized += (mark - trade.entry_price) * trade.quantity * trade.signed
+        return self.config.initial_capital_usdt + self.realized_cash + unrealized
+
+    def _consecutive_losing_days(self, close_time: datetime) -> int:
+        streak = 0
+        expected = close_time.date()
+        while True:
+            expected = expected - timedelta(days=1)
+            pnl = self.daily_price_pnl.get(expected.isoformat())
+            if pnl is None or pnl >= 0:
+                break
+            streak += 1
+        return streak
 
     def _generate_signals(
         self,
@@ -384,13 +449,26 @@ class BacktestEngine:
                 continue
             if signal.direction not in {SignalDirection.LONG, SignalDirection.SHORT}:
                 continue
+            equity = self._current_equity(current)
             state = RiskState(
                 daily_loss_rate=self._daily_loss_rate(close_time),
                 consecutive_losses=self._consecutive_losses(close_time),
                 open_positions=len(self.open_positions),
+                equity_usdt=equity,
+                consecutive_losing_days=self._consecutive_losing_days(close_time),
             )
             decision = self.risk_guard.evaluate(signal, state)
             if decision.status != RiskStatus.APPROVED:
+                continue
+            long_notional, short_notional = self._open_notional_by_side(current)
+            if exposure_block_reason(
+                equity=equity,
+                long_notional=long_notional,
+                short_notional=short_notional,
+                candidate_notional=decision.position_size_usdt,
+                candidate_direction=signal.direction,
+                limits=self.exposure_limits,
+            ):
                 continue
             candle = current[symbol]
             slip = self.config.slippage_rate
@@ -451,10 +529,23 @@ class BacktestEngine:
 
     def _entries_blocked(self, close_time: datetime) -> bool:
         return (
-            self._daily_loss_tripped(close_time)
+            self.halted_at is not None
+            or self._daily_loss_tripped(close_time)
             or self._consecutive_losses(close_time) >= self.config.max_consecutive_losses
             or len(self.open_positions) >= self.config.max_open_positions
         )
+
+    def _open_notional_by_side(self, current: dict[str, Candle]) -> tuple[float, float]:
+        long_notional = 0.0
+        short_notional = 0.0
+        for symbol, trade in self.open_positions.items():
+            mark = current[symbol].close if symbol in current else trade.entry_price
+            notional = trade.quantity * mark
+            if trade.direction == SignalDirection.LONG:
+                long_notional += notional
+            else:
+                short_notional += notional
+        return long_notional, short_notional
 
     def _latest_funding_rate(self, symbol: str, close_time: datetime) -> float:
         rate = 0.0
@@ -695,6 +786,11 @@ def run_backtest_command(args) -> int:
         min_expected_move=settings.MIN_EXPECTED_MOVE,
         position_timeout_hours=settings.POSITION_TIMEOUT_HOURS,
         exit_on_reverse_signal=settings.EXIT_ON_REVERSE_SIGNAL,
+        max_drawdown=settings.MAX_DRAWDOWN,
+        max_total_exposure_rate=settings.MAX_TOTAL_EXPOSURE_RATE,
+        max_net_exposure_rate=settings.MAX_NET_EXPOSURE_RATE,
+        loss_streak_days=settings.LOSS_STREAK_DAYS,
+        loss_streak_risk_multiplier=settings.LOSS_STREAK_RISK_MULTIPLIER,
     )
 
     print(

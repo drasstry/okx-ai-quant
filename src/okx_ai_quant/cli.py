@@ -147,7 +147,16 @@ def _handle_telegram_text(bot: TradingBot, client: TelegramBotClient, text: str)
     if command == "/status":
         client.send(_telegram_status_message(bot))
         return
-    client.send("Supported commands: /overview, /report, 概览, 总结, /status")
+    if command == "/halt":
+        bot.halt("Manual halt via Telegram /halt")
+        client.send("⛔ 已手动停机：新开仓已停止（已有持仓仍按止损/止盈管理）。发送 /resume 恢复。")
+        return
+    if command == "/resume":
+        equity = bot.resume()
+        equity_text = f"{equity:.2f}" if equity > 0 else "-"
+        client.send(f"✅ 已恢复交易，高水位重置为当前权益 {equity_text} USDT。")
+        return
+    client.send("Supported commands: /overview, /report, 概览, 总结, /status, /halt, /resume")
 
 
 def _telegram_status_message(bot: TradingBot) -> str:
@@ -157,10 +166,13 @@ def _telegram_status_message(bot: TradingBot) -> str:
     runtime_symbols = bot.runner.storage.get_state("runtime:symbols")
     runtime_updated_at = bot.runner.storage.get_state("runtime:updated_at")
 
+    halted = bot.runner.storage.get_state("portfolio:halted")
+    halted_line = f"halted={halted}\n" if halted else ""
     if runtime_mode is not None:
         return (
             "OKX AI Quant status\n"
             "source=active bot runtime\n"
+            f"{halted_line}"
             f"mode={runtime_mode}\n"
             f"trading={runtime_trading}\n"
             f"strategy={runtime_strategy}\n"

@@ -20,6 +20,7 @@ from okx_ai_quant.models import (
     SignalDirection,
 )
 from okx_ai_quant.notifier import NotificationError, Notifier
+from okx_ai_quant.portfolio import ExposureLimits, evaluate_drawdown, exposure_block_reason
 from okx_ai_quant.reports import build_trade_overview_fallback, render_trade_overview
 from okx_ai_quant.runner import RunOnceResult, Runner
 
@@ -88,7 +89,7 @@ class TradingBot:
             self.monitor_positions()
 
         tradable_symbols = self._tradable_symbols()
-        self._entry_block_reason = self._okx_entry_health_block_reason()
+        self._entry_block_reason = self._portfolio_block_reason() or self._okx_entry_health_block_reason()
         if self._entry_block_reason:
             self._notify(f"Blocking new entries this cycle: {self._entry_block_reason}")
             return [
@@ -252,6 +253,11 @@ class TradingBot:
         if duplicate_reason:
             return BotCycleResult(symbol=symbol, result=result, skipped_reason=duplicate_reason)
 
+        exposure_reason = self._exposure_block_reason(result)
+        if exposure_reason:
+            self._notify(f"Exposure cap blocked {symbol}: {exposure_reason}")
+            return BotCycleResult(symbol=symbol, result=result, skipped_reason=exposure_reason)
+
         self._mark_signal_seen(result)
         if not self.settings.ENABLE_TRADING:
             self._notify(
@@ -357,6 +363,118 @@ class TradingBot:
                 return order
         return None
 
+    # ------------------------------------------------------- portfolio risk
+    def _portfolio_block_reason(self) -> str | None:
+        """Run the drawdown kill switch; return a reason when entries are halted."""
+        halted = self.runner.storage.get_state("portfolio:halted")
+        equity = self._usdt_equity()
+        if equity <= 0:
+            if halted:
+                return f"Trading halted: {halted} (send /resume to restart)."
+            return None
+
+        stored_hwm = _float(self.runner.storage.get_state("portfolio:hwm"))
+        status = evaluate_drawdown(
+            equity=equity,
+            high_water_mark=stored_hwm if stored_hwm > 0 else equity,
+            max_drawdown=self.settings.MAX_DRAWDOWN,
+        )
+        now = datetime.now(UTC)
+        self.runner.storage.set_state("portfolio:hwm", f"{status.high_water_mark:.8g}", now)
+
+        if halted:
+            return f"Trading halted: {halted} (send /resume to restart)."
+        if not status.tripped:
+            return None
+
+        reason = (
+            f"Drawdown {status.drawdown:.2%} breached MAX_DRAWDOWN "
+            f"{self.settings.MAX_DRAWDOWN:.2%} (equity {equity:.2f}, "
+            f"HWM {status.high_water_mark:.2f})"
+        )
+        self.halt(reason)
+        self._flatten_all_positions(reason)
+        self._send_report(
+            f"⛔ 回撤熔断触发：{reason}。已提交全部平仓并停止开新仓，"
+            "确认后发送 /resume 恢复交易（恢复时高水位将重置为当前权益）。"
+        )
+        return f"Trading halted: {reason} (send /resume to restart)."
+
+    def halt(self, reason: str) -> None:
+        now = datetime.now(UTC)
+        self.runner.storage.set_state("portfolio:halted", reason, now)
+        self.runner.storage.set_state("portfolio:halted_at", now.isoformat(), now)
+
+    def resume(self) -> float:
+        """Clear the halt and re-base the high-water mark to current equity."""
+        now = datetime.now(UTC)
+        equity = self._usdt_equity()
+        if equity > 0:
+            self.runner.storage.set_state("portfolio:hwm", f"{equity:.8g}", now)
+        self.runner.storage.set_state("portfolio:halted", "", now)
+        return equity
+
+    def is_halted(self) -> str | None:
+        return self.runner.storage.get_state("portfolio:halted") or None
+
+    def _flatten_all_positions(self, reason: str) -> None:
+        for position in self.runner.storage.load_open_positions():
+            if not self.settings.ENABLE_TRADING:
+                self._notify(
+                    f"Planned flatten only: {position.symbol} qty={abs(position.quantity):.6g} "
+                    f"({reason}). Set ENABLE_TRADING=true to submit close orders."
+                )
+                continue
+            try:
+                close_order = self.runner.execution_engine.close_position(
+                    position,
+                    reason=ExitReason.RISK_EXIT.value,
+                )
+            except Exception as exc:  # noqa: BLE001 - keep flattening the rest of the book.
+                self._notify(f"Flatten failed for {position.symbol}: {exc}")
+                continue
+            self.runner.storage.insert_order(close_order)
+            self.runner.storage.mark_position_closing(
+                symbol=position.symbol,
+                reason=ExitReason.RISK_EXIT,
+                updated_at=datetime.now(UTC),
+            )
+            self._notify(f"Flatten submitted: {position.symbol} ordId={close_order.order_id or '-'}.")
+
+    def _usdt_equity(self) -> float:
+        balance = self.runner.storage.load_balance("USDT")
+        return float(balance.equity) if balance is not None and balance.equity > 0 else 0.0
+
+    def _open_notional_by_side(self) -> tuple[float, float]:
+        long_notional = 0.0
+        short_notional = 0.0
+        for position in self.runner.storage.load_open_positions():
+            mark = self._latest_market_price(position.symbol)
+            if mark <= 0:
+                mark = position.average_entry
+            notional = abs(position.quantity) * mark * self._contract_pnl_multiplier(
+                position.symbol, mark
+            )
+            if position.side == SignalDirection.LONG:
+                long_notional += notional
+            else:
+                short_notional += notional
+        return long_notional, short_notional
+
+    def _exposure_block_reason(self, result: RunOnceResult) -> str | None:
+        long_notional, short_notional = self._open_notional_by_side()
+        return exposure_block_reason(
+            equity=self._usdt_equity(),
+            long_notional=long_notional,
+            short_notional=short_notional,
+            candidate_notional=result.risk_decision.position_size_usdt,
+            candidate_direction=result.signal.direction,
+            limits=ExposureLimits(
+                max_total_rate=self.settings.MAX_TOTAL_EXPOSURE_RATE,
+                max_net_rate=self.settings.MAX_NET_EXPOSURE_RATE,
+            ),
+        )
+
     def _held_position_reason(self, symbol: str) -> str | None:
         """Block new entries while the symbol already has a position.
 
@@ -423,6 +541,13 @@ class TradingBot:
         now = datetime.now(UTC)
         for snapshot in summary.balance_snapshots(now):
             self.runner.storage.upsert_balance(snapshot)
+            if snapshot.currency == "USDT":
+                self.runner.storage.insert_equity_snapshot(
+                    currency="USDT",
+                    equity=snapshot.equity,
+                    available=snapshot.available,
+                    created_at=now,
+                )
 
     def reconcile_exchange_state(self) -> None:
         self._snapshot_balances()
@@ -780,6 +905,8 @@ class TradingBot:
                 "open_position_count": len(open_positions),
                 "unrealized_pnl_usdt": _fmt(total_unrealized),
                 "realized_pnl_usdt": _fmt(realized),
+                "drawdown": self._current_drawdown_text(),
+                "halted": self.is_halted() or "",
                 "risk_state_open_positions": risk_state.open_positions,
                 "consecutive_losses": risk_state.consecutive_losses,
                 "max_daily_loss": self.settings.MAX_DAILY_LOSS,
@@ -794,6 +921,14 @@ class TradingBot:
             "risk_points": risk_points,
             "failure_review": self._failure_review(),
         }
+
+    def _current_drawdown_text(self) -> str:
+        equity = self._usdt_equity()
+        hwm = _float(self.runner.storage.get_state("portfolio:hwm"))
+        if equity <= 0 or hwm <= 0:
+            return "-"
+        drawdown = max(0.0, 1.0 - equity / max(hwm, equity))
+        return f"{drawdown:.2%}（高水位 {hwm:.2f}，上限 {self.settings.MAX_DRAWDOWN:.0%}）"
 
     def _position_overview(self, position: PositionRecord) -> dict[str, object]:
         mark_price = self._latest_market_price(position.symbol)

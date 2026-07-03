@@ -1,5 +1,5 @@
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from okx_ai_quant.models import (
@@ -184,6 +184,16 @@ class SQLiteStorage:
                 value TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS equity_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                currency TEXT NOT NULL,
+                equity REAL NOT NULL,
+                available REAL NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_equity_snapshots_ccy_time
+                ON equity_snapshots (currency, created_at);
             """
         )
         self.connection.commit()
@@ -437,6 +447,39 @@ class SQLiteStorage:
         ).fetchone()
         self.connection.commit()
         return int(row["id"])
+
+    def insert_equity_snapshot(
+        self,
+        *,
+        currency: str,
+        equity: float,
+        available: float,
+        created_at: datetime,
+    ) -> int:
+        cursor = self.connection.execute(
+            """
+            INSERT INTO equity_snapshots (currency, equity, available, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (currency, equity, available, _to_utc_text(created_at)),
+        )
+        self.connection.commit()
+        return int(cursor.lastrowid)
+
+    def load_equity_series(self, currency: str, limit: int = 2000) -> list[tuple[datetime, float]]:
+        rows = self.connection.execute(
+            """
+            SELECT created_at, equity FROM (
+                SELECT created_at, equity FROM equity_snapshots
+                WHERE currency = ?
+                ORDER BY id DESC
+                LIMIT ?
+            )
+            ORDER BY created_at ASC
+            """,
+            (currency, limit),
+        ).fetchall()
+        return [(_from_utc_text(row["created_at"]), float(row["equity"])) for row in rows]
 
     def load_balance(self, currency: str) -> BalanceSnapshot | None:
         row = self.connection.execute(
@@ -810,8 +853,12 @@ class SQLiteStorage:
                 break
             consecutive_losses += 1
 
+        balance = self.load_balance("USDT")
+        equity_usdt = float(balance.equity) if balance is not None and balance.equity > 0 else 0.0
+
+        capital = equity_usdt if equity_usdt > 0 else (reference_capital_usdt or 0.0)
         daily_loss_rate = 0.0
-        if reference_capital_usdt is not None and reference_capital_usdt > 0:
+        if capital > 0:
             pnl_row = self.connection.execute(
                 """
                 SELECT COALESCE(SUM(realized_pnl), 0.0) AS pnl FROM position_exits
@@ -820,13 +867,42 @@ class SQLiteStorage:
                 (today,),
             ).fetchone()
             realized_today = float(pnl_row["pnl"] if pnl_row is not None else 0.0)
-            daily_loss_rate = max(0.0, -realized_today) / reference_capital_usdt
+            daily_loss_rate = max(0.0, -realized_today) / capital
 
         return RiskState(
             daily_loss_rate=daily_loss_rate,
             consecutive_losses=consecutive_losses,
             open_positions=open_positions,
+            equity_usdt=equity_usdt,
+            consecutive_losing_days=self._consecutive_losing_days(today),
         )
+
+    def _consecutive_losing_days(self, today: str) -> int:
+        """Count consecutive negative-PnL days immediately preceding today.
+
+        A day without any exits breaks the streak: the deleveraging rule is
+        about an active losing run, not stale history.
+        """
+        rows = self.connection.execute(
+            """
+            SELECT substr(closed_at, 1, 10) AS day, SUM(realized_pnl) AS pnl
+            FROM position_exits
+            WHERE substr(closed_at, 1, 10) < ?
+            GROUP BY day
+            ORDER BY day DESC
+            LIMIT 10
+            """,
+            (today,),
+        ).fetchall()
+        streak = 0
+        expected = datetime.fromisoformat(today).date()
+        for row in rows:
+            day = datetime.fromisoformat(str(row["day"])).date()
+            expected = expected - timedelta(days=1)
+            if day != expected or float(row["pnl"]) >= 0:
+                break
+            streak += 1
+        return streak
 
     def _candle_from_row(self, row: sqlite3.Row) -> Candle:
         return Candle(

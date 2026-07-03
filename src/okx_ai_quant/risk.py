@@ -16,6 +16,8 @@ class RiskState:
     daily_loss_rate: float = 0.0
     consecutive_losses: int = 0
     open_positions: int = 0
+    equity_usdt: float = 0.0  # live account equity; 0 = unknown, fall back to reference capital
+    consecutive_losing_days: int = 0
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -40,6 +42,8 @@ class RiskGuard:
         max_consecutive_losses: int = 3,
         max_positions: int = 1,
         leverage: int = 1,
+        loss_streak_days: int = 2,
+        loss_streak_risk_multiplier: float = 0.5,
     ) -> None:
         if not isfinite(reference_capital_usdt) or reference_capital_usdt <= 0:
             raise ValueError("reference_capital_usdt must be greater than 0")
@@ -50,6 +54,12 @@ class RiskGuard:
         _validate_positive_int(max_consecutive_losses, "max_consecutive_losses")
         _validate_positive_int(max_positions, "max_positions")
         _validate_positive_int(leverage, "leverage")
+        _validate_positive_int(loss_streak_days, "loss_streak_days")
+        if (
+            not isfinite(loss_streak_risk_multiplier)
+            or not 0 < loss_streak_risk_multiplier <= 1
+        ):
+            raise ValueError("loss_streak_risk_multiplier must be in (0, 1]")
 
         self.symbols = frozenset(symbols)
         self.reference_capital_usdt = reference_capital_usdt
@@ -58,6 +68,8 @@ class RiskGuard:
         self.max_consecutive_losses = max_consecutive_losses
         self.max_positions = max_positions
         self.leverage = leverage
+        self.loss_streak_days = loss_streak_days
+        self.loss_streak_risk_multiplier = loss_streak_risk_multiplier
 
     def evaluate(self, signal: Signal, state: RiskState) -> RiskDecision:
         if signal.symbol not in self.symbols:
@@ -75,7 +87,7 @@ class RiskGuard:
         if state.open_positions >= self.max_positions:
             return self._reject(signal, "Maximum open position limit reached.")
 
-        position_size_usdt, reason = self._position_size(signal)
+        position_size_usdt, reason = self._position_size(signal, state)
         leverage = self._leverage_for_signal(signal)
         return RiskDecision(
             signal_id=signal.id,
@@ -86,17 +98,35 @@ class RiskGuard:
             created_at=datetime.now(UTC),
         )
 
-    def _position_size(self, signal: Signal) -> tuple[float, str]:
+    def _risk_capital(self, state: RiskState) -> float:
+        """Live equity when known, otherwise the configured reference capital.
+
+        Sizing off live equity makes risk shrink in a drawdown and compound
+        in a run-up; a static reference kept sizing full-size while the
+        account bled.
+        """
+        if isfinite(state.equity_usdt) and state.equity_usdt > 0:
+            return state.equity_usdt
+        return self.reference_capital_usdt
+
+    def _risk_multiplier(self, state: RiskState) -> float:
+        if state.consecutive_losing_days >= self.loss_streak_days:
+            return self.loss_streak_risk_multiplier
+        return 1.0
+
+    def _position_size(self, signal: Signal, state: RiskState) -> tuple[float, str]:
         """Compute notional USDT exposure for an approved signal.
 
-        - Default: ``reference_capital * min(10 * max_risk_per_trade, 0.10)``
-          (kept for backwards-compatible sizing when no stop is provided).
-        - When the signal carries a ``stop_price``, scale the notional so that
-          an adverse move to the stop consumes at most ``max_risk_per_trade``
-          of the reference capital. The result is capped by the default to
-          avoid accidental up-sizing.
+        - Capital base: live equity (fallback: reference capital), scaled by
+          the loss-streak multiplier after consecutive losing days.
+        - Default: ``capital * min(10 * max_risk_per_trade, 0.10)`` when no
+          stop is provided.
+        - When the signal carries a ``stop_price``, scale the notional so an
+          adverse move to the stop consumes at most ``max_risk_per_trade`` of
+          capital, capped by the default to avoid accidental up-sizing.
         """
-        default_size = self.reference_capital_usdt * min(0.10, self.max_risk_per_trade * 10)
+        capital = self._risk_capital(state) * self._risk_multiplier(state)
+        default_size = capital * min(0.10, self.max_risk_per_trade * 10)
         default_reason = "Risk checks passed."
 
         stop_price = getattr(signal, "stop_price", None)
@@ -118,7 +148,7 @@ class RiskGuard:
         if loss_fraction_at_stop <= 0:
             return default_size, default_reason
 
-        risk_budget = self.reference_capital_usdt * self.max_risk_per_trade
+        risk_budget = capital * self.max_risk_per_trade
         sized = risk_budget / loss_fraction_at_stop
         if not isfinite(sized) or sized <= 0:
             return default_size, default_reason
