@@ -364,6 +364,67 @@ def test_equity_based_sizing_shrinks_after_losses():
     assert second.notional_usdt < first.notional_usdt
 
 
+def test_engine_feeds_daily_channel_to_daily_trend_strategy():
+    from okx_ai_quant.strategy import create_strategy
+
+    # Build 70 days of steadily rising candles so the 50-day daily EMA has
+    # enough history (the strategy needs >= slow_span + 1 daily bars).
+    days = 70
+    hours = 24 * days
+    price = 100.0
+    one_hour = []
+    daily = []
+    for h in range(hours):
+        price *= 1.002
+        one_hour.append(_candle(h, open_=price / 1.002, high=price * 1.003, low=price * 0.999, close=price))
+    # Daily candles aligned to UTC midnight.
+    for d in range(days):
+        idx = d * 24
+        day_candles = one_hour[idx : idx + 24]
+        daily.append(
+            Candle(
+                symbol=SYMBOL,
+                timeframe="1D",
+                timestamp=T0 + timedelta(days=d),
+                open=day_candles[0].open,
+                high=max(c.high for c in day_candles),
+                low=min(c.low for c in day_candles),
+                close=day_candles[-1].close,
+                volume=1000.0,
+            )
+        )
+
+    config = BacktestConfig(symbols=[SYMBOL], initial_capital_usdt=10_000.0)
+    engine = BacktestEngine(
+        strategy_name="daily-trend",
+        config=config,
+        data={SYMBOL: SymbolHistory(one_hour=one_hour, four_hour=[], funding=[], daily=daily)},
+        strategy=create_strategy("daily-trend", min_expected_move=0.006),
+        trade_start=T0 + timedelta(days=55),
+    )
+    result = engine.run()
+
+    assert result.trades, "daily-trend should trade the sustained uptrend"
+    assert all(t.direction == SignalDirection.LONG for t in result.trades)
+
+
+def test_window_stats_splits_in_and_out_of_sample():
+    candles = [
+        _candle(0),
+        _candle(1, high=106.0, close=104.0),  # TP win early
+        _candle(2),
+    ]
+    engine = _engine(candles, StubStrategy())
+    result = engine.run()
+
+    # The only trade closed at hour 2; a cutoff after it sees no OOS trades.
+    after = T0 + timedelta(hours=10)
+    oos = result.window_stats(since=after)
+    assert oos["trades"] == 0
+    ins = result.window_stats(since=T0)
+    assert ins["trades"] == 1
+
+
 def test_report_renders_stats_and_curve():
     candles = [
         _candle(0),

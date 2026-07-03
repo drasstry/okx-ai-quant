@@ -14,6 +14,8 @@ AVAILABLE_STRATEGIES = (
     "multi-timeframe-trend",
     "volatility-adjusted-momentum",
     "cross-sectional-momentum-funding",
+    "funding-carry",
+    "daily-trend",
 )
 
 
@@ -588,8 +590,9 @@ class CrossSectionalMomentumFundingStrategy:
         one_hour: dict[str, list[Candle]],
         four_hour: dict[str, list[Candle]],
         funding_rates: dict[str, float] | None = None,
+        daily: dict[str, list[Candle]] | None = None,
     ) -> None:
-        del four_hour
+        del four_hour, daily
         funding_rates = funding_rates or {}
         metrics: list[tuple[str, float, float, float, float]] = []
         required = max(self.momentum_lookback + 1, self.volatility_lookback + 1, self.atr_period)
@@ -762,6 +765,207 @@ class CrossSectionalMomentumFundingStrategy:
         )
 
 
+@dataclass(kw_only=True)
+class FundingCarryStrategy:
+    """Trade the funding rate as the primary signal, not just a filter.
+
+    Persistently high positive funding means crowded longs paying shorts, so
+    shorting both collects funding and fades a crowded book that often
+    mean-reverts down (and symmetrically for deeply negative funding). The
+    edge is thin per funding period, so entries need wide stops and a long
+    hold (the framework timeout is ~72h ≈ 9 funding periods) for the
+    collected carry to clear round-trip costs. A trend filter blocks fading a
+    strong move purely for carry.
+    """
+
+    min_expected_move: float
+    funding_entry: float = 0.0004  # per-8h funding magnitude to act on
+    atr_period: int = 14
+    mean_period: int = 24
+    trend_fast: int = 12
+    trend_slow: int = 48
+    max_trend_gap: float = 0.02  # block fading a trend stronger than this
+    stop_atr_multiple: float = 2.5
+    _scores: dict[str, StrategySignal] = field(default_factory=dict, init=False)
+
+    def prepare_universe(
+        self,
+        *,
+        symbols: list[str],
+        one_hour: dict[str, list[Candle]],
+        four_hour: dict[str, list[Candle]],
+        funding_rates: dict[str, float] | None = None,
+        daily: dict[str, list[Candle]] | None = None,
+    ) -> None:
+        del four_hour, daily
+        funding_rates = funding_rates or {}
+        self._scores = {}
+        required = max(self.atr_period + 1, self.mean_period, self.trend_slow)
+        for symbol in symbols:
+            candles = one_hour.get(symbol, [])
+            if len(candles) < required:
+                continue
+            funding = funding_rates.get(symbol, 0.0)
+            if abs(funding) < self.funding_entry:
+                continue
+            self._scores[symbol] = self._build_signal(symbol, candles, funding)
+
+    def generate(self, symbol: str, one_hour: list[Candle], four_hour: list[Candle]) -> Signal:
+        del one_hour, four_hour
+        cached = self._scores.get(symbol)
+        if cached is None:
+            return _hold(symbol, "Funding is inside the neutral band or data is insufficient.")
+        return cached
+
+    def _build_signal(self, symbol: str, candles: list[Candle], funding: float) -> StrategySignal:
+        frame = _frame(candles)
+        close = frame["close"]
+        latest_close = float(close.iloc[-1])
+        latest_atr = atr(frame, self.atr_period).iloc[-1]
+        mean = float(close.tail(self.mean_period).mean())
+        fast = ema(close, self.trend_fast).iloc[-1]
+        slow = ema(close, self.trend_slow).iloc[-1]
+        if pd.isna(latest_atr) or latest_close <= 0 or slow <= 0:
+            return _hold(symbol, "Not enough candles for stable funding-carry values.")
+
+        atr_rate = float(latest_atr) / latest_close
+        expected_move = max(atr_rate, abs(funding) * 9.0)  # ~9 funding periods over the hold
+        if expected_move < self.min_expected_move:
+            return _hold(symbol, "Funding-carry expected move below cost threshold.", expected_move=expected_move)
+
+        trend_gap = float(fast - slow) / latest_close
+        stop_distance = max(float(latest_atr) * self.stop_atr_multiple, latest_close * self.min_expected_move)
+
+        # Positive funding: longs pay -> collect by shorting (fade crowded longs).
+        if funding >= self.funding_entry:
+            if trend_gap > self.max_trend_gap:
+                return _hold(symbol, "Skip short: uptrend too strong to fade for carry.", expected_move=expected_move)
+            target = min(mean, latest_close - stop_distance * 0.8)
+            return _signal(
+                symbol=symbol,
+                direction=SignalDirection.SHORT,
+                confidence=_bounded_confidence(0.55 + min(abs(funding) * 100, 0.3)),
+                reason=(
+                    f"Funding carry short: funding {funding:.5f}/8h (crowded longs), "
+                    f"collect carry + fade toward mean {mean:.6g}."
+                ),
+                expected_move=expected_move,
+                entry_price=latest_close,
+                stop_price=latest_close + stop_distance,
+                target_price=target,
+            )
+
+        # Deeply negative funding: shorts pay -> collect by going long.
+        if -trend_gap > self.max_trend_gap:
+            return _hold(symbol, "Skip long: downtrend too strong to fade for carry.", expected_move=expected_move)
+        target = max(mean, latest_close + stop_distance * 0.8)
+        return _signal(
+            symbol=symbol,
+            direction=SignalDirection.LONG,
+            confidence=_bounded_confidence(0.55 + min(abs(funding) * 100, 0.3)),
+            reason=(
+                f"Funding carry long: funding {funding:.5f}/8h (crowded shorts), "
+                f"collect carry + fade toward mean {mean:.6g}."
+            ),
+            expected_move=expected_move,
+            entry_price=latest_close,
+            stop_price=latest_close - stop_distance,
+            target_price=target,
+        )
+
+
+@dataclass(kw_only=True)
+class DailyTrendStrategy:
+    """Longer-horizon trend on daily candles to cut turnover and fee drag.
+
+    Uses real 1D bars (supplied via ``prepare_universe(daily=...)``) with slow
+    EMAs, so signals flip a handful of times over months rather than hourly.
+    Wide daily-ATR stops give trends room to breathe.
+    """
+
+    requires_daily: bool = True
+    min_expected_move: float
+    fast_span: int = 20
+    slow_span: int = 50
+    atr_period: int = 14
+    stop_atr_multiple: float = 2.0
+    target_atr_multiple: float = 3.0
+    _scores: dict[str, StrategySignal] = field(default_factory=dict, init=False)
+
+    def prepare_universe(
+        self,
+        *,
+        symbols: list[str],
+        one_hour: dict[str, list[Candle]],
+        four_hour: dict[str, list[Candle]],
+        funding_rates: dict[str, float] | None = None,
+        daily: dict[str, list[Candle]] | None = None,
+    ) -> None:
+        del one_hour, four_hour, funding_rates
+        daily = daily or {}
+        self._scores = {}
+        required = max(self.slow_span + 1, self.atr_period + 1)
+        for symbol in symbols:
+            candles = daily.get(symbol, [])
+            if len(candles) < required:
+                continue
+            self._scores[symbol] = self._build_signal(symbol, candles)
+
+    def generate(self, symbol: str, one_hour: list[Candle], four_hour: list[Candle]) -> Signal:
+        del four_hour
+        cached = self._scores.get(symbol)
+        if cached is None:
+            return _hold(symbol, "Not enough daily candles for daily-trend, or trend not aligned.")
+        # Enter at the latest intraday price, but keep the daily-derived plan.
+        if not one_hour:
+            return cached
+        latest_close = float(one_hour[-1].close)
+        if latest_close <= 0 or cached.direction == SignalDirection.HOLD:
+            return cached
+        return cached
+
+    def _build_signal(self, symbol: str, candles: list[Candle]) -> StrategySignal:
+        frame = _frame(candles)
+        close = frame["close"]
+        latest_close = float(close.iloc[-1])
+        fast = ema(close, self.fast_span).iloc[-1]
+        slow = ema(close, self.slow_span).iloc[-1]
+        latest_atr = atr(frame, self.atr_period).iloc[-1]
+        if pd.isna(fast) or pd.isna(slow) or pd.isna(latest_atr) or latest_close <= 0:
+            return _hold(symbol, "Not enough daily candles for stable daily-trend values.")
+
+        atr_rate = float(latest_atr) / latest_close
+        expected_move = max(atr_rate, abs(float(fast - slow)) / latest_close)
+        if expected_move < self.min_expected_move:
+            return _hold(symbol, "Daily-trend expected move below cost threshold.", expected_move=expected_move)
+
+        stop = float(latest_atr) * self.stop_atr_multiple
+        target = float(latest_atr) * self.target_atr_multiple
+        if fast > slow and latest_close > slow:
+            return _signal(
+                symbol=symbol,
+                direction=SignalDirection.LONG,
+                confidence=_bounded_confidence(0.55 + min(expected_move * 4, 0.3)),
+                reason="Daily-trend long: fast daily EMA above slow with price above the slow EMA.",
+                expected_move=expected_move,
+                entry_price=latest_close,
+                stop_price=latest_close - stop,
+                target_price=latest_close + target,
+            )
+        if fast < slow and latest_close < slow:
+            return _signal(
+                symbol=symbol,
+                direction=SignalDirection.SHORT,
+                confidence=_bounded_confidence(0.55 + min(expected_move * 4, 0.3)),
+                reason="Daily-trend short: fast daily EMA below slow with price below the slow EMA.",
+                expected_move=expected_move,
+                entry_price=latest_close,
+                stop_price=latest_close + stop,
+                target_price=latest_close - target,
+            )
+        return _hold(symbol, "Daily-trend EMAs not aligned.", expected_move=expected_move)
+
+
 def create_strategy(name: str, *, min_expected_move: float):
     match name:
         case "ema-rsi-atr":
@@ -778,6 +982,10 @@ def create_strategy(name: str, *, min_expected_move: float):
             return VolatilityAdjustedMomentumStrategy(min_expected_move=min_expected_move)
         case "cross-sectional-momentum-funding":
             return CrossSectionalMomentumFundingStrategy(min_expected_move=min_expected_move)
+        case "funding-carry":
+            return FundingCarryStrategy(min_expected_move=min_expected_move)
+        case "daily-trend":
+            return DailyTrendStrategy(min_expected_move=min_expected_move)
         case _:
             choices = ", ".join(AVAILABLE_STRATEGIES)
             raise ValueError(f"Unknown strategy {name!r}. Choose one of: {choices}")

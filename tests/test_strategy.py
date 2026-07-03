@@ -4,9 +4,11 @@ from okx_ai_quant.models import Candle, Signal, SignalDirection
 from okx_ai_quant.strategy import (
     AVAILABLE_STRATEGIES,
     CrossSectionalMomentumFundingStrategy,
+    DailyTrendStrategy,
     DonchianBreakoutStrategy,
     EmaMomentumStrategy,
     EmaRsiAtrStrategy,
+    FundingCarryStrategy,
     MultiTimeframeTrendStrategy,
     RsiBollingerReversionStrategy,
     VolatilityAdjustedMomentumStrategy,
@@ -103,6 +105,8 @@ def test_strategy_factory_lists_supported_strategies():
         "multi-timeframe-trend",
         "volatility-adjusted-momentum",
         "cross-sectional-momentum-funding",
+        "funding-carry",
+        "daily-trend",
     )
     assert isinstance(create_strategy("ema-rsi-atr", min_expected_move=0.006), EmaRsiAtrStrategy)
     assert isinstance(
@@ -383,3 +387,132 @@ def test_volatility_adjusted_momentum_holds_when_momentum_is_noise():
 
     assert signal.direction == SignalDirection.HOLD
     assert "momentum/atr" in signal.reason.lower()
+
+
+def _daily_candles(symbol: str, closes: list[float]) -> list[Candle]:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    out = []
+    for index, close in enumerate(closes):
+        out.append(
+            Candle(
+                symbol=symbol,
+                timeframe="1D",
+                timestamp=start + timedelta(days=index),
+                open=close - 0.5,
+                high=close + 2.0,
+                low=close - 2.0,
+                close=close,
+                volume=1000.0,
+            )
+        )
+    return out
+
+
+def test_funding_carry_shorts_high_positive_funding():
+    symbol = "BTC-USDT-SWAP"
+    strategy = FundingCarryStrategy(min_expected_move=0.003, funding_entry=0.0004)
+    # Flat-ish price so the trend filter does not block the fade.
+    closes = [100.0 + (index % 3) * 0.1 for index in range(60)]
+    one_hour = _candles(symbol, "1H", closes)
+
+    strategy.prepare_universe(
+        symbols=[symbol],
+        one_hour={symbol: one_hour},
+        four_hour={symbol: one_hour},
+        funding_rates={symbol: 0.001},  # high positive funding: crowded longs
+    )
+    signal = strategy.generate(symbol, one_hour=one_hour, four_hour=one_hour)
+
+    assert signal.direction == SignalDirection.SHORT
+    assert signal.stop_price > signal.entry_price  # stop above for a short
+    assert "funding carry short" in signal.reason.lower()
+
+
+def test_funding_carry_longs_deep_negative_funding():
+    symbol = "ETH-USDT-SWAP"
+    strategy = FundingCarryStrategy(min_expected_move=0.003, funding_entry=0.0004)
+    closes = [100.0 - (index % 3) * 0.1 for index in range(60)]
+    one_hour = _candles(symbol, "1H", closes)
+
+    strategy.prepare_universe(
+        symbols=[symbol],
+        one_hour={symbol: one_hour},
+        four_hour={symbol: one_hour},
+        funding_rates={symbol: -0.001},
+    )
+    signal = strategy.generate(symbol, one_hour=one_hour, four_hour=one_hour)
+
+    assert signal.direction == SignalDirection.LONG
+    assert signal.stop_price < signal.entry_price
+
+
+def test_funding_carry_holds_inside_neutral_band():
+    symbol = "BTC-USDT-SWAP"
+    strategy = FundingCarryStrategy(min_expected_move=0.003, funding_entry=0.0004)
+    one_hour = _candles(symbol, "1H", [100.0] * 60)
+
+    strategy.prepare_universe(
+        symbols=[symbol],
+        one_hour={symbol: one_hour},
+        four_hour={symbol: one_hour},
+        funding_rates={symbol: 0.0001},  # small funding: no carry edge
+    )
+    signal = strategy.generate(symbol, one_hour=one_hour, four_hour=one_hour)
+
+    assert signal.direction == SignalDirection.HOLD
+
+
+def test_funding_carry_skips_fading_a_strong_trend():
+    symbol = "BTC-USDT-SWAP"
+    strategy = FundingCarryStrategy(min_expected_move=0.003, funding_entry=0.0004, max_trend_gap=0.02)
+    # Strong uptrend: fast EMA well above slow, so shorting for carry is blocked.
+    closes = [100.0 * (1.02 ** index) for index in range(60)]
+    one_hour = _candles(symbol, "1H", closes)
+
+    strategy.prepare_universe(
+        symbols=[symbol],
+        one_hour={symbol: one_hour},
+        four_hour={symbol: one_hour},
+        funding_rates={symbol: 0.001},
+    )
+    signal = strategy.generate(symbol, one_hour=one_hour, four_hour=one_hour)
+
+    assert signal.direction == SignalDirection.HOLD
+    assert "too strong to fade" in signal.reason.lower()
+
+
+def test_daily_trend_declares_daily_requirement_and_goes_long_in_uptrend():
+    symbol = "BTC-USDT-SWAP"
+    strategy = DailyTrendStrategy(min_expected_move=0.006)
+    assert strategy.requires_daily is True
+
+    closes = [100.0 * (1.01 ** index) for index in range(80)]
+    daily = _daily_candles(symbol, closes)
+    one_hour = _candles(symbol, "1H", [closes[-1]] * 5)
+
+    strategy.prepare_universe(
+        symbols=[symbol],
+        one_hour={symbol: one_hour},
+        four_hour={symbol: one_hour},
+        daily={symbol: daily},
+    )
+    signal = strategy.generate(symbol, one_hour=one_hour, four_hour=one_hour)
+
+    assert signal.direction == SignalDirection.LONG
+    assert signal.stop_price < signal.entry_price < signal.target_price
+
+
+def test_daily_trend_holds_without_daily_data():
+    symbol = "BTC-USDT-SWAP"
+    strategy = DailyTrendStrategy(min_expected_move=0.006)
+    one_hour = _candles(symbol, "1H", [100.0] * 5)
+
+    strategy.prepare_universe(
+        symbols=[symbol],
+        one_hour={symbol: one_hour},
+        four_hour={symbol: one_hour},
+        daily={symbol: []},
+    )
+    signal = strategy.generate(symbol, one_hour=one_hour, four_hour=one_hour)
+
+    assert signal.direction == SignalDirection.HOLD

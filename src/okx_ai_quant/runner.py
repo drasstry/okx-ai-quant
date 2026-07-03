@@ -129,12 +129,16 @@ class Runner:
         if not callable(prepare):
             return
 
+        wants_daily = bool(getattr(self.strategy, "requires_daily", False))
         one_hour: dict[str, list] = {}
         four_hour: dict[str, list] = {}
+        daily: dict[str, list] = {}
         funding_rates: dict[str, float] = {}
         for symbol in symbols:
             one_hour[symbol] = self._fetch_store_candles(symbol, "1H")
             four_hour[symbol] = self._fetch_store_candles(symbol, "4H")
+            if wants_daily:
+                daily[symbol] = self._fetch_store_candles(symbol, "1D")
             funding_rate = self._fetch_funding_rate(symbol)
             if funding_rate is not None:
                 funding_rates[symbol] = funding_rate
@@ -144,6 +148,7 @@ class Runner:
             one_hour=one_hour,
             four_hour=four_hour,
             funding_rates=funding_rates,
+            daily=daily,
         )
 
     def _fetch_store_candles(self, symbol: str, timeframe: str):

@@ -684,6 +684,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     backtest.add_argument("--data-dir", default="data/backtest", help="Candle cache directory")
     backtest.add_argument("--out", default="backtest_report.html", help="HTML report path")
     backtest.add_argument(
+        "--oos-days",
+        type=int,
+        default=45,
+        help="Out-of-sample window in days at the end of the period (0 to disable)",
+    )
+    backtest.add_argument(
         "--offline",
         action="store_true",
         help="Use only cached data; do not call the OKX API",

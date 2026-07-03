@@ -105,6 +105,8 @@ src/okx_ai_quant/
 | `multi-timeframe-trend` | Multi-timeframe trend | `4H` and `1H` EMA stacks align |
 | `volatility-adjusted-momentum` | Volatility-filtered momentum | Momentum must clear ATR noise |
 | `cross-sectional-momentum-funding` | Cross-sectional momentum | Ranks the symbol universe, trades the strongest/weakest tails, filters expensive funding, and scales leverage down when volatility rises |
+| `funding-carry` | Funding-rate carry | Uses the funding rate as the primary signal: shorts crowded-long extreme positive funding (and longs extreme negative), with a trend filter, wide stops, and a long hold so multi-period carry clears costs |
+| `daily-trend` | Higher-timeframe trend | Slow EMAs on real `1D` candles; low turnover to cut the fee drag that sinks `1H` strategies |
 
 Every strategy returns `LONG`, `SHORT`, or `HOLD`.<br>
 Even when a strategy returns `LONG` or `SHORT`, the order still needs to pass the risk guard before execution.
@@ -233,7 +235,19 @@ uv run okx-ai-quant telegram-listen --mode demo
 
 # One strategy cycle
 uv run okx-ai-quant run-once --symbol BTC-USDT-SWAP --strategy ema-rsi-atr
+
+# Backtest over OKX history (all strategies, 180 days) and write an HTML report
+uv run okx-ai-quant backtest --days 180 --capital 80000
+
+# Backtest specific strategies with a custom out-of-sample window
+uv run okx-ai-quant backtest --days 180 --strategies funding-carry,daily-trend --oos-days 45
 ```
+
+The backtest replays the live strategy and risk code over confirmed OKX
+candles (funding-rate history included) and reports **gross vs net PnL,
+turnover, cost drag, and an out-of-sample split**, so a strategy that is
+profitable before fees but sunk by costs — or one that only worked in-sample —
+is obvious. Data is cached under `--data-dir`; use `--offline` to reuse it.
 
 Telegram commands:
 

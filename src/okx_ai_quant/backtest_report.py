@@ -10,23 +10,43 @@ from okx_ai_quant.backtest import BacktestConfig, StrategyResult
 
 def render_backtest_summary(results: list[StrategyResult]) -> str:
     header = (
-        f"{'策略':<34}{'总收益':>10}{'最大回撤':>10}{'交易数':>8}"
-        f"{'胜率':>8}{'盈亏比':>8}{'费用':>12}"
+        f"{'策略':<34}{'净收益':>9}{'毛收益':>9}{'成本占比':>9}"
+        f"{'回撤':>8}{'交易':>6}{'换手':>7}{'胜率':>7}{'盈亏比':>7}"
     )
     lines = [header, "-" * len(header)]
-    for result in sorted(results, key=lambda item: item.total_return, reverse=True):
+    for result in sorted(results, key=lambda item: item.stats()["gross_return"], reverse=True):
         stats = result.stats()
         profit_factor = stats["profit_factor"]
         pf_text = "∞" if profit_factor == float("inf") else f"{profit_factor:.2f}"
         lines.append(
             f"{stats['strategy']:<34}"
-            f"{stats['total_return']:>9.2%}"
-            f"{stats['max_drawdown']:>9.2%}"
-            f"{stats['trades']:>8}"
+            f"{stats['total_return']:>8.2%}"
+            f"{stats['gross_return']:>9.2%}"
+            f"{stats['cost_drag']:>9.2%}"
+            f"{stats['max_drawdown']:>8.1%}"
+            f"{stats['trades']:>6}"
+            f"{stats['turnover']:>6.1f}x"
             f"{stats['win_rate']:>7.1%}"
-            f"{pf_text:>8}"
-            f"{stats['total_fees']:>11.2f}"
+            f"{pf_text:>7}"
         )
+    lines.append("")
+    lines.append("毛收益=扣费前价格盈亏；净收益=扣除手续费/滑点/资金费后。毛正净负=有信号但被成本吃掉。")
+    return "\n".join(lines)
+
+
+def render_oos_summary(results: list[StrategyResult], *, oos_start: datetime) -> str:
+    header = f"样本外检验（{oos_start.date().isoformat()} 之后平仓的交易）"
+    lines = [header, "-" * len(header), f"{'策略':<34}{'样本外净收益':>14}{'样本外毛收益':>14}{'交易':>6}{'胜率':>7}"]
+    for result in sorted(
+        results, key=lambda item: item.window_stats(since=oos_start)["gross_return"], reverse=True
+    ):
+        w = result.window_stats(since=oos_start)
+        lines.append(
+            f"{result.strategy:<34}{w['net_return']:>13.2%}{w['gross_return']:>14.2%}"
+            f"{w['trades']:>6}{w['win_rate']:>7.1%}"
+        )
+    lines.append("")
+    lines.append("样本内有边际、样本外消失 = 过拟合。只有样本外毛收益也为正的策略才值得继续。")
     return "\n".join(lines)
 
 
@@ -36,9 +56,11 @@ def render_backtest_html(
     config: BacktestConfig,
     start: datetime,
     end: datetime,
+    oos_start: datetime | None = None,
 ) -> str:
-    ordered = sorted(results, key=lambda item: item.total_return, reverse=True)
+    ordered = sorted(results, key=lambda item: item.stats()["gross_return"], reverse=True)
     rows = "".join(_stats_row(result) for result in ordered)
+    oos_block = _oos_html(ordered, oos_start) if oos_start is not None else ""
     sections = "".join(_strategy_section(result) for result in ordered)
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -76,11 +98,14 @@ def render_backtest_html(
 </p>
 
 <h2>策略对比</h2>
+<p class="meta">按<strong>毛收益</strong>排序（扣费前价格盈亏）。毛收益为正但净收益为负，说明信号有边际但被成本吃掉；毛收益为负说明信号本身没有边际。</p>
 <div class="chart"><table>
-<tr><th>策略</th><th>最终权益</th><th>总收益</th><th>最大回撤</th><th>交易数</th>
-<th>胜率</th><th>盈亏比</th><th>总费用</th><th>资金费</th></tr>
+<tr><th>策略</th><th>净收益</th><th>毛收益</th><th>成本占比</th><th>最大回撤</th>
+<th>交易数</th><th>换手</th><th>胜率</th><th>盈亏比</th></tr>
 {rows}
 </table></div>
+
+{oos_block}
 
 {sections}
 
@@ -105,15 +130,40 @@ def _stats_row(result: StrategyResult) -> str:
     return (
         "<tr>"
         f"<td>{escape(str(stats['strategy']))}</td>"
-        f"<td>{stats['final_equity']:,.0f}</td>"
         f"<td class=\"{_sign_class(stats['total_return'])}\">{stats['total_return']:.2%}</td>"
+        f"<td class=\"{_sign_class(stats['gross_return'])}\">{stats['gross_return']:.2%}</td>"
+        f"<td class=\"neg\">-{stats['cost_drag']:.2%}</td>"
         f"<td class=\"neg\">{stats['max_drawdown']:.2%}</td>"
         f"<td>{stats['trades']}</td>"
+        f"<td>{stats['turnover']:.1f}x</td>"
         f"<td>{stats['win_rate']:.1%}</td>"
         f"<td>{pf_text}</td>"
-        f"<td>{stats['total_fees']:,.0f}</td>"
-        f"<td class=\"{_sign_class(stats['total_funding'])}\">{stats['total_funding']:,.0f}</td>"
         "</tr>"
+    )
+
+
+def _oos_html(results: list[StrategyResult], oos_start: datetime) -> str:
+    rows = ""
+    for result in sorted(
+        results, key=lambda item: item.window_stats(since=oos_start)["gross_return"], reverse=True
+    ):
+        w = result.window_stats(since=oos_start)
+        rows += (
+            "<tr>"
+            f"<td>{escape(result.strategy)}</td>"
+            f"<td class=\"{_sign_class(w['net_return'])}\">{w['net_return']:.2%}</td>"
+            f"<td class=\"{_sign_class(w['gross_return'])}\">{w['gross_return']:.2%}</td>"
+            f"<td>{w['trades']}</td>"
+            f"<td>{w['win_rate']:.1%}</td>"
+            "</tr>"
+        )
+    return (
+        f"<h2>样本外检验（{oos_start.date().isoformat()} 之后）</h2>"
+        "<p class=\"meta\">用最后一段行情做样本外验证：样本内有边际、样本外消失就是过拟合。"
+        "只有样本外毛收益也为正的策略才值得继续投入。</p>"
+        "<div class=\"chart\"><table>"
+        "<tr><th>策略</th><th>样本外净收益</th><th>样本外毛收益</th><th>交易数</th><th>胜率</th></tr>"
+        f"{rows}</table></div>"
     )
 
 

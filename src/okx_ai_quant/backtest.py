@@ -68,6 +68,7 @@ class SymbolHistory:
     one_hour: list[Candle]
     four_hour: list[Candle]
     funding: list[tuple[datetime, float]] = field(default_factory=list)
+    daily: list[Candle] = field(default_factory=list)
 
 
 @dataclass(kw_only=True)
@@ -122,6 +123,29 @@ class StrategyResult:
                 worst = min(worst, equity / peak - 1.0)
         return worst
 
+    def window_stats(self, *, since: datetime) -> dict[str, object]:
+        """Net/gross summary of trades that closed on or after ``since``.
+
+        Used for the out-of-sample split: an edge that only exists before the
+        cutoff is overfitting, not signal.
+        """
+        window = [
+            trade
+            for trade in self.trades
+            if trade.closed_at is not None and trade.closed_at >= since
+        ]
+        wins = [trade for trade in window if trade.net_pnl > 0]
+        net = sum(trade.net_pnl for trade in window)
+        gross = sum(trade.price_pnl for trade in window)
+        return {
+            "trades": len(window),
+            "net_pnl": net,
+            "gross_pnl": gross,
+            "net_return": net / self.initial_capital if self.initial_capital else 0.0,
+            "gross_return": gross / self.initial_capital if self.initial_capital else 0.0,
+            "win_rate": (len(wins) / len(window)) if window else 0.0,
+        }
+
     def stats(self) -> dict[str, object]:
         closed = [trade for trade in self.trades if trade.closed_at is not None]
         wins = [trade for trade in closed if trade.net_pnl > 0]
@@ -131,10 +155,22 @@ class StrategyResult:
         reasons: dict[str, int] = {}
         for trade in closed:
             reasons[trade.exit_reason or "-"] = reasons.get(trade.exit_reason or "-", 0) + 1
+        total_fees = sum(trade.fees for trade in self.trades)
+        total_funding = sum(trade.funding for trade in self.trades)
+        net_pnl = self.final_equity - self.initial_capital
+        # Gross = net stripped of costs, so a "profitable before fees but
+        # killed by fees" strategy is visible at a glance.
+        gross_pnl = net_pnl + total_fees - total_funding
+        traded_notional = sum(trade.notional_usdt for trade in self.trades)
         return {
             "strategy": self.strategy,
             "final_equity": self.final_equity,
             "total_return": self.total_return,
+            "gross_pnl": gross_pnl,
+            "gross_return": gross_pnl / self.initial_capital if self.initial_capital else 0.0,
+            "net_pnl": net_pnl,
+            "cost_drag": total_fees / self.initial_capital if self.initial_capital else 0.0,
+            "turnover": traded_notional / self.initial_capital if self.initial_capital else 0.0,
             "max_drawdown": self.max_drawdown,
             "trades": len(closed),
             "open_at_end": len(self.trades) - len(closed),
@@ -142,8 +178,8 @@ class StrategyResult:
             "profit_factor": (gross_win / gross_loss) if gross_loss > 0 else float("inf"),
             "avg_win": (gross_win / len(wins)) if wins else 0.0,
             "avg_loss": (-gross_loss / len(losses)) if losses else 0.0,
-            "total_fees": sum(trade.fees for trade in self.trades),
-            "total_funding": sum(trade.funding for trade in self.trades),
+            "total_fees": total_fees,
+            "total_funding": total_funding,
             "exit_reasons": reasons,
             "halted_at": self.halted_at,
         }
@@ -202,7 +238,9 @@ class BacktestEngine:
         )
         cursors: dict[str, int] = {symbol: -1 for symbol in self.data}
         four_cursors: dict[str, int] = {symbol: 0 for symbol in self.data}
+        daily_cursors: dict[str, int] = {symbol: 0 for symbol in self.data}
         funding_cursors: dict[str, int] = {symbol: 0 for symbol in self.data}
+        self._wants_daily = bool(getattr(self.strategy, "requires_daily", False))
         previous_close_time: datetime | None = None
 
         for ts in timeline:
@@ -229,7 +267,9 @@ class BacktestEngine:
             self._daily_loss_flatten(current, close_time)
             self._drawdown_check(current, close_time)
 
-            signals = self._generate_signals(current, cursors, four_cursors, close_time)
+            signals = self._generate_signals(
+                current, cursors, four_cursors, daily_cursors, close_time
+            )
             if self.config.exit_on_reverse_signal:
                 self._reverse_signal_exits(current, signals, close_time)
             self._entries(current, signals, close_time)
@@ -365,10 +405,12 @@ class BacktestEngine:
         current: dict[str, Candle],
         cursors: dict[str, int],
         four_cursors: dict[str, int],
+        daily_cursors: dict[str, int],
         close_time: datetime,
     ) -> dict[str, object]:
         one_hour_windows: dict[str, list[Candle]] = {}
         four_hour_windows: dict[str, list[Candle]] = {}
+        daily_windows: dict[str, list[Candle]] = {}
         for symbol in current:
             history = self.data[symbol]
             pointer = cursors[symbol]
@@ -383,6 +425,18 @@ class BacktestEngine:
             four_cursors[symbol] = cursor
             four_hour_windows[symbol] = candles[max(0, cursor - CANDLE_LIMIT) : cursor]
 
+            if self._wants_daily:
+                dcursor = daily_cursors[symbol]
+                dcandles = history.daily
+                # Only expose daily bars that have fully closed by close_time.
+                while (
+                    dcursor < len(dcandles)
+                    and dcandles[dcursor].timestamp + timedelta(days=1) <= close_time
+                ):
+                    dcursor += 1
+                daily_cursors[symbol] = dcursor
+                daily_windows[symbol] = dcandles[max(0, dcursor - CANDLE_LIMIT) : dcursor]
+
         prepare = getattr(self.strategy, "prepare_universe", None)
         if callable(prepare):
             funding_rates = {
@@ -393,6 +447,7 @@ class BacktestEngine:
                 one_hour=one_hour_windows,
                 four_hour=four_hour_windows,
                 funding_rates=funding_rates,
+                daily=daily_windows,
             )
 
         signals: dict[str, object] = {}
@@ -772,6 +827,11 @@ def run_backtest_command(args) -> int:
     else:
         strategy_names = [item.strip() for item in args.strategies.split(",") if item.strip()]
 
+    wants_daily = any(
+        getattr(create_strategy(name, min_expected_move=0.006), "requires_daily", False)
+        for name in strategy_names
+    )
+
     end = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
     start = end - timedelta(days=args.days)
     config = BacktestConfig(
@@ -803,6 +863,7 @@ def run_backtest_command(args) -> int:
         end=end,
         cache_dir=Path(args.data_dir),
         offline=args.offline,
+        with_daily=wants_daily,
     )
     if not data:
         print("No historical data available; nothing to backtest.")
@@ -819,11 +880,17 @@ def run_backtest_command(args) -> int:
         )
         results.append(engine.run())
 
+    oos_start = end - timedelta(days=args.oos_days) if args.oos_days > 0 else None
     print()
     print(render_backtest_summary(results))
+    if oos_start is not None:
+        from okx_ai_quant.backtest_report import render_oos_summary
+
+        print()
+        print(render_oos_summary(results, oos_start=oos_start))
     out_path = Path(args.out)
     out_path.write_text(
-        render_backtest_html(results, config=config, start=start, end=end),
+        render_backtest_html(results, config=config, start=start, end=end, oos_start=oos_start),
         encoding="utf-8",
     )
     print(f"\nHTML report written to {out_path}")
@@ -838,9 +905,13 @@ def load_history(
     cache_dir: Path,
     offline: bool = False,
     with_funding: bool = True,
+    with_daily: bool = False,
     progress: bool = True,
 ) -> dict[str, SymbolHistory]:
     warmup = timedelta(hours=CANDLE_LIMIT * 4 + 8)
+    # Daily strategies need many daily bars; warm up far enough back for a
+    # 50-day EMA plus margin.
+    daily_warmup = timedelta(days=CANDLE_LIMIT + 60)
     data: dict[str, SymbolHistory] = {}
     for symbol in symbols:
         if progress:
@@ -851,6 +922,11 @@ def load_history(
         four_hour = fetch_okx_candles(
             symbol, "4H", start=start - warmup, end=end, cache_dir=cache_dir, offline=offline
         )
+        daily: list[Candle] = []
+        if with_daily:
+            daily = fetch_okx_candles(
+                symbol, "1D", start=start - daily_warmup, end=end, cache_dir=cache_dir, offline=offline
+            )
         funding: list[tuple[datetime, float]] = []
         if with_funding:
             try:
@@ -860,7 +936,9 @@ def load_history(
             except RuntimeError as exc:
                 print(f"warning: funding history unavailable for {symbol}: {exc}")
         if one_hour:
-            data[symbol] = SymbolHistory(one_hour=one_hour, four_hour=four_hour, funding=funding)
+            data[symbol] = SymbolHistory(
+                one_hour=one_hour, four_hour=four_hour, funding=funding, daily=daily
+            )
         elif progress:
             print(f"warning: no candles for {symbol}; skipping")
     return data

@@ -163,7 +163,7 @@ class FakeUniverseStrategy(FakeStrategy):
         super().__init__(SignalDirection.HOLD)
         self.universe_calls = []
 
-    def prepare_universe(self, *, symbols, one_hour, four_hour, funding_rates):
+    def prepare_universe(self, *, symbols, one_hour, four_hour, funding_rates, daily=None):
         self.universe_calls.append(
             {
                 "symbols": symbols,
