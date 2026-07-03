@@ -772,9 +772,9 @@ class SQLiteStorage:
         ``open_positions`` counts real tracked positions plus non-terminal
         orders, so a filled entry keeps blocking additional new entries until
         that position is closed. ``daily_loss_rate`` and
-        ``consecutive_losses`` come from realized position exits, so the
-        MAX_DAILY_LOSS / MAX_CONSECUTIVE_LOSSES breakers act on actual trading
-        PnL rather than order bookkeeping states.
+        ``consecutive_losses`` come from today's (UTC) realized position
+        exits, so the MAX_DAILY_LOSS / MAX_CONSECUTIVE_LOSSES breakers act on
+        actual trading PnL and reset each day instead of latching forever.
         """
         from okx_ai_quant.risk import RiskState
 
@@ -794,12 +794,15 @@ class SQLiteStorage:
             pending_rows["n"] if pending_rows is not None else 0
         )
 
+        today = datetime.now(UTC).date().isoformat()
         recent_exits = self.connection.execute(
             """
             SELECT realized_pnl FROM position_exits
+            WHERE substr(closed_at, 1, 10) = ?
             ORDER BY id DESC
             LIMIT 20
-            """
+            """,
+            (today,),
         ).fetchall()
         consecutive_losses = 0
         for row in recent_exits:
@@ -809,7 +812,6 @@ class SQLiteStorage:
 
         daily_loss_rate = 0.0
         if reference_capital_usdt is not None and reference_capital_usdt > 0:
-            today = datetime.now(UTC).date().isoformat()
             pnl_row = self.connection.execute(
                 """
                 SELECT COALESCE(SUM(realized_pnl), 0.0) AS pnl FROM position_exits

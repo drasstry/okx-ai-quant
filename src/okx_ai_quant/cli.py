@@ -655,6 +655,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     subparsers.add_parser("wizard", help="Choose mode, strategy, symbol, and leverage interactively")
     subparsers.add_parser("menu", help="Open the interactive bot control menu")
 
+    backtest = subparsers.add_parser(
+        "backtest",
+        help="Replay strategies over OKX history and write an HTML report",
+    )
+    backtest.add_argument("--days", type=int, default=180, help="Lookback window in days")
+    backtest.add_argument("--symbols", default="", help="CSV of instIds; defaults to SYMBOLS")
+    backtest.add_argument(
+        "--strategies",
+        default="all",
+        help="CSV of strategy names, or 'all'",
+    )
+    backtest.add_argument("--capital", type=float, default=80_000.0, help="Initial capital USDT")
+    backtest.add_argument("--fee", type=float, default=0.0005, help="Taker fee per side")
+    backtest.add_argument("--slippage", type=float, default=0.0005, help="Slippage per side")
+    backtest.add_argument("--data-dir", default="data/backtest", help="Candle cache directory")
+    backtest.add_argument("--out", default="backtest_report.html", help="HTML report path")
+    backtest.add_argument(
+        "--offline",
+        action="store_true",
+        help="Use only cached data; do not call the OKX API",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "run-once":
         runner = build_runner(
@@ -685,6 +707,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             _close_if_possible(bot.runner)
     elif args.command == "telegram-listen":
         run_telegram_listener(mode=args.mode, timeout=args.timeout)
+    elif args.command == "backtest":
+        from okx_ai_quant.backtest import run_backtest_command
+
+        return run_backtest_command(args)
     elif args.command == "wizard":
         return run_wizard()
     elif args.command == "menu":

@@ -238,6 +238,28 @@ def test_bot_submit_mode_places_order_after_dry_run(tmp_path):
     ]
 
 
+def test_bot_does_not_stack_entries_on_symbol_with_open_position(tmp_path):
+    bot, client = _bot(tmp_path, enable_trading=True)
+    bot.runner.storage.upsert_position(
+        symbol="BTC-USDT-SWAP",
+        side=SignalDirection.LONG,
+        quantity=0.5,
+        average_entry=100.0,
+        stop_loss=95.0,
+        take_profit=110.0,
+        opened_at=datetime(2026, 5, 7, 8, 0, tzinfo=UTC),
+        updated_at=datetime(2026, 5, 7, 8, 0, tzinfo=UTC),
+    )
+    _set_exchange_position(client, avg_px="100")
+
+    results = bot.run_once()
+
+    assert results[0].skipped_reason == (
+        "BTC-USDT-SWAP already has an open position; not stacking entries."
+    )
+    assert all("attachAlgoOrds" not in call for call in client.trade_api.calls)
+
+
 def test_bot_reduces_exchange_leverage_when_above_env_cap(tmp_path):
     bot, client = _bot(tmp_path, enable_trading=True)
     position = PositionRecord(
@@ -420,6 +442,7 @@ def test_bot_marks_local_position_closed_when_missing_on_exchange(tmp_path):
 
 def test_bot_still_submits_close_order_when_new_trade_loss_limit_is_reached(tmp_path):
     bot, client = _bot(tmp_path, enable_trading=True)
+    now = datetime.now(UTC)
     for index in range(3):
         bot.runner.storage.insert_position_exit(
             PositionExitRecord(
@@ -431,8 +454,8 @@ def test_bot_still_submits_close_order_when_new_trade_loss_limit_is_reached(tmp_
                 exit_price=100.0,
                 quantity=1.0,
                 realized_pnl=-10.0,
-                opened_at=datetime(2026, 5, 7, 6, index, tzinfo=UTC),
-                closed_at=datetime(2026, 5, 7, 7, index, tzinfo=UTC),
+                opened_at=now,
+                closed_at=now,
                 notes="losing trade",
             )
         )

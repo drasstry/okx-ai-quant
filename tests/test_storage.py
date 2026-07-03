@@ -405,3 +405,30 @@ def test_load_risk_state_computes_daily_loss_and_consecutive_losses(tmp_path):
 
         # Without reference capital the loss rate stays neutral.
         assert storage.load_risk_state().daily_loss_rate == 0.0
+
+
+def test_load_risk_state_consecutive_losses_reset_on_new_day(tmp_path):
+    from okx_ai_quant.models import ExitReason, PositionExitRecord
+
+    with SQLiteStorage(tmp_path / "quant.sqlite3") as storage:
+        storage.initialize()
+        yesterday = datetime.now(UTC) - timedelta(days=1)
+        for _ in range(3):
+            storage.insert_position_exit(
+                PositionExitRecord(
+                    position_id=None,
+                    symbol="BTC-USDT-SWAP",
+                    side=SignalDirection.LONG,
+                    reason=ExitReason.STOP_LOSS,
+                    entry_price=100.0,
+                    exit_price=90.0,
+                    quantity=1.0,
+                    realized_pnl=-10.0,
+                    opened_at=yesterday,
+                    closed_at=yesterday,
+                    notes="old losing streak",
+                )
+            )
+
+        # Yesterday's losing streak must not lock trading out today.
+        assert storage.load_risk_state().consecutive_losses == 0

@@ -15,6 +15,7 @@ from okx_ai_quant.models import (
     OrderRecord,
     OrderState,
     PositionRecord,
+    PositionState,
     RiskStatus,
     SignalDirection,
 )
@@ -239,6 +240,10 @@ class TradingBot:
         if pending_reason:
             return BotCycleResult(symbol=symbol, result=None, skipped_reason=pending_reason)
 
+        held_reason = self._held_position_reason(symbol)
+        if held_reason:
+            return BotCycleResult(symbol=symbol, result=None, skipped_reason=held_reason)
+
         result = self.runner.run_once(symbol)
         if result.risk_decision.status != RiskStatus.APPROVED:
             return BotCycleResult(symbol=symbol, result=result)
@@ -350,6 +355,23 @@ class TradingBot:
         for order in self.runner.storage.load_open_orders():
             if order.symbol == symbol and order.order_type.startswith("market_close"):
                 return order
+        return None
+
+    def _held_position_reason(self, symbol: str) -> str | None:
+        """Block new entries while the symbol already has a position.
+
+        Without this, a sustained trend adds another full-size entry every
+        candle (each add also overwriting the previous stop plan), so the
+        per-symbol exposure grows far beyond what the risk model sized.
+        Reverse-signal/stop exits still manage the open position.
+        """
+        position = self.runner.storage.load_position(symbol)
+        if (
+            position is not None
+            and position.state in {PositionState.OPEN, PositionState.CLOSING}
+            and abs(position.quantity) > 0
+        ):
+            return f"{symbol} already has an open position; not stacking entries."
         return None
 
     def _pending_order_reason(self, symbol: str) -> str | None:
