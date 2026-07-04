@@ -837,7 +837,11 @@ class TradingBot:
         return None
 
     def _save_entry_plan(self, result: RunOnceResult, order: OrderRecord) -> None:
-        expires_at = datetime.now(UTC) + timedelta(hours=self.settings.POSITION_TIMEOUT_HOURS)
+        timeout_hours = (
+            getattr(self.runner.strategy, "recommended_timeout_hours", None)
+            or self.settings.POSITION_TIMEOUT_HOURS
+        )
+        expires_at = datetime.now(UTC) + timedelta(hours=timeout_hours)
         plan = {
             "opened_at": datetime.now(UTC).isoformat(),
             "expires_at": expires_at.isoformat(),

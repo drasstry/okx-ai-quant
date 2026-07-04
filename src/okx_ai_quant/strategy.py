@@ -880,10 +880,14 @@ class DailyTrendStrategy:
 
     Uses real 1D bars (supplied via ``prepare_universe(daily=...)``) with slow
     EMAs, so signals flip a handful of times over months rather than hourly.
-    Wide daily-ATR stops give trends room to breathe.
+    Wide daily-ATR stops give trends room to breathe, and the recommended
+    holding period is weeks: the framework's 72h default timeout would force
+    a close-and-reenter churn every 3 days that pays round-trip costs for
+    nothing (in backtests it produced 158 timeout exits out of 190 trades).
     """
 
     requires_daily: bool = True
+    recommended_timeout_hours: int = 504  # 21 days; daily trends need weeks
     min_expected_move: float
     fast_span: int = 20
     slow_span: int = 50

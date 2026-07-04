@@ -331,7 +331,13 @@ class BacktestEngine:
                 self._close(trade, price=float(target), at=close_time, reason="TAKE_PROFIT")
 
     def _timeout_exits(self, current: dict[str, Candle], close_time: datetime) -> None:
-        timeout = timedelta(hours=self.config.position_timeout_hours)
+        # Strategies with a longer natural holding period override the
+        # framework default (same as the live bot's entry plan).
+        timeout_hours = (
+            getattr(self.strategy, "recommended_timeout_hours", None)
+            or self.config.position_timeout_hours
+        )
+        timeout = timedelta(hours=timeout_hours)
         for symbol in list(self.open_positions):
             candle = current.get(symbol)
             trade = self.open_positions[symbol]

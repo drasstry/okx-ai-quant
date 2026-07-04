@@ -493,3 +493,15 @@ def test_engine_smoke_with_real_strategy_on_trending_data():
     assert result.equity_curve
     closed = [trade for trade in result.trades if trade.closed_at is not None]
     assert all(trade.exit_reason for trade in closed)
+
+
+def test_strategy_recommended_timeout_overrides_config():
+    # Config timeout is 2h, but the strategy asks for 100h: no timeout exit.
+    candles = [_candle(index) for index in range(6)]
+    strategy = StubStrategy(stop=90.0, target=120.0)
+    strategy.recommended_timeout_hours = 100
+    engine = _engine(candles, strategy, position_timeout_hours=2)
+    result = engine.run()
+
+    assert result.trades
+    assert result.trades[0].closed_at is None  # still open at the end
